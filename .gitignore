@@ -1,4 +1,5 @@
 .venv/
+.build-venv/
 __pycache__/
 *.pyc
 data/
@@ -11,6 +12,9 @@ config.json
 .codex/
 .claude/
 .cursor/
+build/
+dist/
+*.spec
 *.md
 !README.md
 !TBH_EFFICIENCY_LOG_SPEC.md

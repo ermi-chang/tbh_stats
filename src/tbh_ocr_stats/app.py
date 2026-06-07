@@ -1,11 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 from collections import deque
-import json
 import re
-import shutil
-import sqlite3
 import statistics
 import sys
 import time
@@ -48,6 +45,19 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+)
+
+from .runtime_env import (
+    DEFAULT_ANCHOR_TEMPLATE,
+    DEFAULT_BOSS_TEMPLATE,
+    configure_tesseract,
+    db_connect,
+    init_db as runtime_init_db,
+    load_config as runtime_load_config,
+    find_tesseract as runtime_find_tesseract,
+    save_config as runtime_save_config,
+    session_export_paths,
+    user_anchor_template_path,
 )
 
 
@@ -133,7 +143,7 @@ I18N = {
         "ステージ別ハイスコア（1-1〜3-10）": "Stage best scores (1-1 to 3-10)",
         "選択ステージリセット": "Reset selected",
         "全リセット": "Reset all",
-        "各ステージの最高効率を保存します。10件以上あるステージは外れ値を除外してハイスコアを判定します。": "Stores the best score per stage. After 10+ logs, outliers are ignored before picking the best score.",
+        "各ステージの最高効率を保存します。3件以上あるステージは外れ値を除外してハイスコアを判定します。": "Stores the best score per stage. After 3+ logs, outliers are ignored before picking the best score.",
         "最高GPS": "Best GPS",
         "最高GPH": "Best GPH",
         "採用/全件": "Used/All",
@@ -191,7 +201,7 @@ I18N = {
         "ステージ別ハイスコア（1-1〜3-10）": "关卡最高效率（1-1〜3-10）",
         "選択ステージリセット": "重置所选",
         "全リセット": "全部重置",
-        "各ステージの最高効率を保存します。10件以上あるステージは外れ値を除外してハイスコアを判定します。": "保存每个关卡的最高效率。记录达到10件后，会排除异常值再判断最高值。",
+        "各ステージの最高効率を保存します。3件以上あるステージは外れ値を除外してハイスコアを判定します。": "保存每个关卡的最高效率。记录达到3件后，会排除异常值再判断最高值。",
         "最高GPS": "最高GPS",
         "最高GPH": "最高GPH",
         "採用/全件": "采用/全部",
@@ -212,15 +222,6 @@ def source_key_from_text(text: str) -> str:
             if text == v:
                 return k
     return text
-
-APP_DIR = Path(__file__).resolve().parents[2]
-CONFIG_PATH = APP_DIR / "config.json"
-DATA_DIR = APP_DIR / "data"
-EXPORT_DIR = APP_DIR / "exports"
-DB_PATH = DATA_DIR / "tbh_ocr_stats.sqlite3"
-ASSET_DIR = APP_DIR / "assets"
-DEFAULT_ANCHOR_TEMPLATE = ASSET_DIR / "default_anchor_gold.png"
-DEFAULT_BOSS_TEMPLATE = ASSET_DIR / "default_boss_icon.png"
 
 # 添付してもらった default_anchor_gold.png はゲーム内スケール x1.5 の状態で切り出したもの。
 # ゲーム側の設定は x1 / x1.25 / x1.5 / x2 / x3 の5段階なので、
@@ -288,155 +289,24 @@ def now_iso() -> str:
 
 
 def find_tesseract() -> Optional[str]:
-    """Locate tesseract.exe without requiring the user to reselect it after every zip update."""
-    candidates: List[str] = []
-
-    def add(v: Optional[str]):
-        if v and v not in candidates:
-            candidates.append(v)
-
-    # 1) PATH / winget installations
-    add(shutil.which("tesseract"))
-    add(shutil.which("tesseract.exe"))
-
-    # 2) Standard Windows installation locations
-    for path in [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"C:\Users\%USERNAME%\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-    ]:
-        add(str(Path(path.replace("%USERNAME%", Path.home().name))))
-
-    # 3) Reuse config from older extracted versions next to this folder.
-    #    This prevents the path from being lost when the user downloads jp5/jp6/etc.
-    try:
-        parent = APP_DIR.parent
-        for cfg_path in parent.glob("tbh_ocr_stats*/config.json"):
-            if cfg_path == CONFIG_PATH:
-                continue
-            try:
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                add(cfg.get("tesseract_path"))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    for c in candidates:
-        try:
-            if c and Path(c).exists():
-                return str(Path(c))
-        except Exception:
-            continue
-    return None
+    return runtime_find_tesseract()
 
 
 def resolve_tesseract(cfg: dict) -> Optional[str]:
     """Set pytesseract command if available and return the resolved path."""
-    raw = (cfg.get("tesseract_path") or "").strip().strip('"')
-    if raw and Path(raw).exists():
-        pytesseract.pytesseract.tesseract_cmd = raw
-        return raw
-    found = find_tesseract()
-    if found:
-        cfg["tesseract_path"] = found
-        pytesseract.pytesseract.tesseract_cmd = found
-        return found
-    return None
+    return configure_tesseract(cfg)
 
 
 def load_config() -> dict:
-    """Load config while preserving user settings across zip updates.
-
-    If the current folder has no config.json yet, reuse the newest sibling
-    tbh_ocr_stats*/config.json. This prevents OCR thresholds, inversion and
-    tesseract path from looking reset when a new version is extracted.
-    """
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    try:
-        parent = APP_DIR.parent
-        candidates = []
-        for cfg_path in parent.glob("tbh_ocr_stats*/config.json"):
-            if cfg_path == CONFIG_PATH:
-                continue
-            try:
-                candidates.append((cfg_path.stat().st_mtime, cfg_path))
-            except Exception:
-                pass
-        if candidates:
-            _, latest = max(candidates, key=lambda x: x[0])
-            return json.loads(latest.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+    return runtime_load_config()
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    runtime_save_config(cfg)
 
 
 def init_db() -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS samples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                ts REAL NOT NULL,
-                ts_iso TEXT NOT NULL,
-                money INTEGER,
-                raw_text TEXT,
-                accepted INTEGER NOT NULL,
-                note TEXT
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                start_money INTEGER,
-                end_money INTEGER,
-                gain INTEGER,
-                elapsed REAL,
-                avg_mps REAL,
-                avg_mph REAL
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stage_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                ts REAL NOT NULL,
-                ts_iso TEXT NOT NULL,
-                stage TEXT,
-                duration_sec INTEGER,
-                money INTEGER,
-                money_delta INTEGER,
-                mps REAL,
-                mph REAL,
-                raw_text TEXT
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stage_highscore_resets (
-                stage TEXT PRIMARY KEY,
-                reset_after_ts REAL NOT NULL,
-                reset_at_iso TEXT NOT NULL
-            )
-            """
-        )
+    runtime_init_db()
 
 
 @dataclass
@@ -1729,8 +1599,6 @@ class MainWindow(QMainWindow):
         self.stage_notice_key: Optional[Tuple[str, int]] = None
         self.stage_notice_last_seen = 0.0
         self.stage_notice_logged = False
-        self.stage_window_sec = int(self.cfg.get("history_window_sec", 300))
-        self.history_view_mode = self.cfg.get("history_view_mode", "agg")
         self.ocr_busy = False
         self.packet_sniffer: Optional[PacketPulseSniffer] = None  # legacy unused
         self.stage_pulse_active_until = 0.0
@@ -2260,8 +2128,11 @@ class MainWindow(QMainWindow):
         return cfg
 
     def save_settings(self):
-        self.cfg = self.build_runtime_cfg()
+        self.sync_runtime_cfg_from_ui()
         save_config(self.cfg)
+
+    def sync_runtime_cfg_from_ui(self):
+        self.cfg = self.build_runtime_cfg()
 
     def refresh_roi_state(self):
         target = ROI_LABELS.get(self.current_roi_target, self.current_roi_target)
@@ -2327,9 +2198,9 @@ class MainWindow(QMainWindow):
     def schedule_ocr_preview(self):
         if not hasattr(self, "preview_timer"):
             return
-        # スライダー/反転変更は即保存。更新版へ上書きしても設定が残るようにする。
+        # プレビュー調整は一時反映のみにして、保存は明示操作時だけ行う。
         try:
-            self.save_settings()
+            self.sync_runtime_cfg_from_ui()
         except Exception:
             pass
         # 対象切替時にスクショ取得まで走ると重い。プレビュー画像がある時だけ遅延更新。
@@ -2544,34 +2415,153 @@ class MainWindow(QMainWindow):
         self.pool.start(worker)
         return True
 
+    def _refresh_stage_views(self):
+        self.refresh_stage_summary_table()
+        self.refresh_efficiency_table()
+        self.update_recommendation()
+
+    def _set_stage_wait_start(self):
+        self.stage_state = "WAIT_START"
+        self.stage_blue_seen = False
+        self.pending_stage_finish_ts = None
+
+    def _set_stage_running(self, start_gold: Optional[int], ts: float):
+        self.current_stage_start_gold = start_gold
+        self.current_stage_start_ts = ts
+        self.stage_state = "RUNNING"
+        self.stage_blue_seen = False
+        self.pending_stage_finish_ts = None
+
+    def _set_stage_finish_pending(self, ts: float):
+        self.pending_stage_finish_ts = ts
+        self.stage_state = "FINISH_PENDING"
+
+    def _set_stage_finishing(self, ts: float):
+        self.pending_stage_finish_ts = ts
+        self.last_finish_transition_ts = ts
+        self.stage_state = "FINISHING"
+        self.stage_blue_seen = False
+
+    def _begin_session_runtime(self, session_id: str, start_ts: float, result: MoneyOCRResult):
+        self.session_id = session_id
+        self.session_start_ts = start_ts
+        self.start_money = result.money
+        self.last_money = result.money
+        self.last_stage_money = result.money
+        self.samples = [(start_ts, result.money)]
+        self.session_positive_gain = 0
+        self.last_stage_key = None
+        self.last_stage_logged_at = 0.0
+        self.stage_notice_key = None
+        self.stage_notice_last_seen = 0.0
+        self.stage_notice_logged = False
+        self.stage_pulse_active_until = 0.0
+        self.last_stage_pulse_at = 0.0
+        self.current_stage_start_gold = None
+        self.current_stage_start_ts = None
+        self.gold_decreased_during_stage = False
+        self.last_finish_transition_ts = 0.0
+        self._set_stage_wait_start()
+
+    def _persist_session_start(self, result: MoneyOCRResult):
+        if not self.session_id or self.session_start_ts is None:
+            return
+        with db_connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO sessions(session_id, started_at, start_money) VALUES(?,?,?)",
+                (self.session_id, now_iso(), result.money),
+            )
+            con.execute(
+                "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
+                (self.session_id, self.session_start_ts, now_iso(), result.money, result.raw_text, 1, "session_start"),
+            )
+
+    def _persist_session_stop(self, elapsed: float, gain: int, avg_mps: float):
+        if not self.session_id:
+            return
+        with db_connect() as con:
+            con.execute(
+                "UPDATE sessions SET ended_at=?, end_money=?, gain=?, elapsed=?, avg_mps=?, avg_mph=? WHERE session_id=?",
+                (now_iso(), self.last_money, gain, elapsed, avg_mps, avg_mps * 3600, self.session_id),
+            )
+
+    def _apply_money_result(self, result: WorkerResult) -> Tuple[int, str]:
+        accepted = 0
+        note = ""
+        if result.money is None:
+            return accepted, note
+        if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
+            # Large sudden drop is normally an OCR miss. Do not let it create negative stage GPS/GPH.
+            result.money = None
+            return 0, "ocr_drop_ignored"
+
+        if self.last_money is not None and result.money < self.last_money:
+            # Real spending or a small OCR wobble. Accept current gold for display, but mark the
+            # current stage as unsafe so it is not scored with a negative/understated delta.
+            note = "gold_decrease_detected"
+            if self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
+                self.gold_decreased_during_stage = True
+
+        accepted = 1
+        prev_money_for_gain = self.last_money
+        if prev_money_for_gain is not None:
+            self.session_positive_gain += max(0, int(result.money) - int(prev_money_for_gain))
+        self.last_money = result.money
+        self.samples.append((result.ts, result.money))
+        cutoff = result.ts - 900
+        self.samples = [(t, m) for t, m in self.samples if t >= cutoff]
+        self.update_stats(result.money)
+        return accepted, note
+
+    def _persist_worker_sample(self, result: WorkerResult, accepted: int, note: str):
+        if not self.session_id:
+            return
+        with db_connect() as con:
+            con.execute(
+                "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
+                (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note),
+            )
+
+    def _handle_worker_purpose(self, result: WorkerResult):
+        if result.purpose == "stage_start":
+            if result.money is not None:
+                self.current_stage_start_gold = result.money
+                self.current_stage_start_ts = result.ts
+                self.gold_decreased_during_stage = False
+            return
+        if result.purpose == "stage_finish":
+            self.commit_stage_from_finish_ocr(result)
+
+    def _show_worker_debug(self, result: WorkerResult):
+        debug_text = f"[{result.purpose}] 所持金: {result.money} / {result.money_raw}\nステージ/秒数: {result.stage} / {result.duration_sec}秒 / {result.stage_raw}"
+        self.raw_lbl.setText(debug_text)
+        if hasattr(self, "debug_last_lbl"):
+            self.debug_last_lbl.setText("最後のOCR: " + debug_text)
+
+    # Stage state machine entrypoint. UI changes should not alter this flow casually.
     def begin_stage_run(self, ts: float, source: str = "gauge"):
         """Start a stage measurement. Uses the latest accepted gold immediately, then tries one OCR refresh."""
         if self.current_stage_start_ts and ts - self.current_stage_start_ts < 2.0:
             return
-        self.current_stage_start_ts = ts
-        self.current_stage_start_gold = self.last_money
-        self.stage_state = "RUNNING"
-        self.stage_blue_seen = False
+        self._set_stage_running(self.last_money, ts)
         self.gold_decreased_during_stage = False
         self.status.showMessage(f"開始G={self.current_stage_start_gold if self.current_stage_start_gold is not None else '-'}")
         # Rare OCR at stage start improves gold accuracy without running OCR continuously.
         self.request_ocr_purpose("stage_start")
 
+    # Completes the gauge-driven stage boundary and may request a finish OCR sample.
     def finish_stage_run(self, ts: float):
         if ts - float(self.last_finish_transition_ts or 0.0) < 1.0:
             return
-        self.pending_stage_finish_ts = ts
         # OCRが別処理中ならFINISHINGで固めず、空いた瞬間に再実行する。
         if self.ocr_busy:
-            self.stage_state = "FINISH_PENDING"
+            self._set_stage_finish_pending(ts)
             self.status.showMessage("終了OCR待機中")
             return
-        self.last_finish_transition_ts = ts
-        self.stage_state = "FINISHING"
-        self.stage_blue_seen = False
+        self._set_stage_finishing(ts)
         self.status.showMessage("終了OCR")
         if not self.request_ocr_purpose("stage_finish"):
-            self.stage_state = "FINISH_PENDING"
+            self._set_stage_finish_pending(ts)
 
     def next_gauge_interval_sec(self, result: GaugeResult) -> float:
         """Adaptive gauge polling.
@@ -2596,6 +2586,7 @@ class MainWindow(QMainWindow):
             self.raw_lbl.setText(f"ゲージ {result.raw} / 次{sec:g}s")
 
     @Slot(object)
+    # Gauge callbacks drive stage segmentation; UI tweaks should avoid changing this logic.
     def on_gauge_finished(self, result: GaugeResult):
         self.gauge_busy = False
         if not self.running:
@@ -2646,6 +2637,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"ステージOCR補正: {stage}→{corrected}")
         return corrected
 
+    # Commits one stage record. This is coupled to scoring, dedupe, and DB persistence.
     def commit_stage_from_finish_ocr(self, result: WorkerResult):
         """Commit one row for one finished stage.
 
@@ -2659,7 +2651,7 @@ class MainWindow(QMainWindow):
         end_money = result.money if result.money is not None else self.last_money
         if end_money is None:
             self.status.showMessage("終了OCRで所持金が読めませんでした")
-            self.stage_state = "WAIT_START"
+            self._set_stage_wait_start()
             return
         start_gold = self.current_stage_start_gold
         if start_gold is None:
@@ -2677,16 +2669,10 @@ class MainWindow(QMainWindow):
             # Do not create negative GPS/GPH. Reset the baseline to the current gold and continue.
             raw = f"spend_or_decrease_excluded start={start_gold} end={end_money} delta={delta} measured={measured_elapsed}s / {result.stage_raw}"
             self.last_stage_money = end_money
-            self.current_stage_start_gold = end_money
-            self.current_stage_start_ts = result.ts
-            self.stage_state = "RUNNING"
-            self.stage_blue_seen = False
+            self._set_stage_running(end_money, result.ts)
             self.gold_decreased_during_stage = False
-            self.pending_stage_finish_ts = None
             self.status.showMessage("G減少を検出: この周回は集計除外")
-            self.refresh_stage_summary_table()
-            self.refresh_efficiency_table()
-            self.update_recommendation()
+            self._refresh_stage_views()
             return
         valid = bool(stage and dur and dur > 0 and delta >= 0)
         gps = (delta / dur) if valid else None
@@ -2700,7 +2686,7 @@ class MainWindow(QMainWindow):
             # time are normally separated by approximately duration seconds, not a few seconds.
             merge_window = max(6.0, min(45.0, float(dur) * 0.35))
             try:
-                with sqlite3.connect(DB_PATH) as con:
+                with db_connect() as con:
                     row = con.execute(
                         """
                         SELECT id, ts, COALESCE(money_delta,0), raw_text
@@ -2742,7 +2728,7 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"重複マージ確認エラー: {exc}")
 
         if not merged:
-            with sqlite3.connect(DB_PATH) as con:
+            with db_connect() as con:
                 con.execute(
                     "INSERT INTO stage_runs(session_id, ts, ts_iso, stage, duration_sec, money, money_delta, mps, mph, raw_text) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (self.session_id, result.ts, now_iso(), stage, dur, end_money, delta, gps, gph, raw),
@@ -2756,17 +2742,12 @@ class MainWindow(QMainWindow):
             self.stage_loop_lbl.setText(f"{stage}  {loops_per_hour:,.1f}回")
         # Do not immediately treat the same purple/reset frame as a new clear.
         # The next run starts from this end gold, but a new log requires a fresh blue_reached transition.
-        self.current_stage_start_gold = end_money
-        self.current_stage_start_ts = result.ts
-        self.stage_state = "RUNNING"
-        self.stage_blue_seen = False
-        self.pending_stage_finish_ts = None
-        self.refresh_stage_summary_table()
-        self.refresh_efficiency_table()
-        self.update_recommendation()
+        self._set_stage_running(end_money, result.ts)
+        self._refresh_stage_views()
         action = "ステージ記録を統合" if merged else "ステージ記録"
         self.status.showMessage(action + ": " + (f"{stage} {dur}s +{delta}G" if valid else f"未確定 +{delta}G"))
 
+    # Session bootstrap touches OCR, runtime ROI resolution, timers, and persistence together.
     def start_session(self):
         self.save_settings()
         if not resolve_tesseract(self.cfg):
@@ -2788,43 +2769,22 @@ class MainWindow(QMainWindow):
         if res.money is None:
             QMessageBox.warning(self, "OCR失敗", "開始時の所持金が読めません。範囲・OCR設定を調整してください。")
             return
-        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_start_ts = time.time()
-        self.start_money = res.money
-        self.last_money = res.money
-        self.last_stage_money = res.money
-        self.samples = [(self.session_start_ts, res.money)]
-        self.session_positive_gain = 0
-        self.last_stage_key = None
-        self.last_stage_logged_at = 0.0
-        self.stage_notice_key = None
-        self.stage_notice_last_seen = 0.0
-        self.stage_notice_logged = False
-        self.stage_pulse_active_until = 0.0
-        self.last_stage_pulse_at = 0.0
-        self.stage_state = "WAIT_START"
-        self.stage_blue_seen = False
-        self.current_stage_start_gold = None
-        self.current_stage_start_ts = None
-        self.gold_decreased_during_stage = False
-        self.last_finish_transition_ts = 0.0
-        self.pending_stage_finish_ts = None
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute("INSERT OR REPLACE INTO sessions(session_id, started_at, start_money) VALUES(?,?,?)", (self.session_id, now_iso(), res.money))
-            con.execute("INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)", (self.session_id, self.session_start_ts, now_iso(), res.money, res.raw_text, 1, "session_start"))
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_start_ts = time.time()
+        self._begin_session_runtime(session_id, session_start_ts, res)
+        self._persist_session_start(res)
         self.running = True
         # jp21: steam通信パルスは廃止。右下進捗ゲージの青到達→紫戻りでステージ区切りを判定。
         self.status_pill.setText("計測中")
         self.status.showMessage(f"開始 G={res.money:,}")
-        self.refresh_stage_summary_table()
-        self.refresh_efficiency_table()
-        self.update_recommendation()
+        self._refresh_stage_views()
         self.update_stats(res.money)
         self.ocr_timer.start(int(max(1.0, float(self.cfg.get("poll_interval", 5.0) or 5.0)) * 1000))
         self.gauge_timer.start(1200)
         self.request_ocr_tick()
         self.request_gauge_tick()
 
+    # Session shutdown also finalizes aggregates in the DB; keep UI-only edits out of here.
     def stop_session(self):
         self.running = False
         self.ocr_timer.stop()
@@ -2834,8 +2794,7 @@ class MainWindow(QMainWindow):
             elapsed = max(0.001, time.time() - self.session_start_ts)
             gain = int(max(0, getattr(self, "session_positive_gain", 0)))
             avg_mps = gain / elapsed
-            with sqlite3.connect(DB_PATH) as con:
-                con.execute("UPDATE sessions SET ended_at=?, end_money=?, gain=?, elapsed=?, avg_mps=?, avg_mph=? WHERE session_id=?", (now_iso(), self.last_money, gain, elapsed, avg_mps, avg_mps * 3600, self.session_id))
+            self._persist_session_stop(elapsed, gain, avg_mps)
         self.status_pill.setText("停止")
         self.status.showMessage("停止しました")
 
@@ -2864,6 +2823,7 @@ class MainWindow(QMainWindow):
                     best = age
         return best
 
+    # OCR worker results update live money, stage state, and sample persistence in one place.
     def on_worker_finished(self, result: WorkerResult):
         self.ocr_busy = False
         if not self.running:
@@ -2871,66 +2831,17 @@ class MainWindow(QMainWindow):
         if result.error:
             self.status.showMessage(f"OCRエラー: {result.error}")
             return
-        accepted = 0
-        note = ""
-        accepted_money = result.money
-        if result.money is not None:
-            if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
-                # Large sudden drop is normally an OCR miss. Do not let it create negative stage GPS/GPH.
-                note = "ocr_drop_ignored"
-                accepted_money = None
-                result.money = None
-            else:
-                if self.last_money is not None and result.money < self.last_money:
-                    # Real spending or a small OCR wobble. Accept current gold for display, but mark the
-                    # current stage as unsafe so it is not scored with a negative/understated delta.
-                    note = "gold_decrease_detected"
-                    if self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
-                        self.gold_decreased_during_stage = True
-                accepted = 1
-                prev_money_for_gain = self.last_money
-                if prev_money_for_gain is not None and result.money is not None:
-                    self.session_positive_gain += max(0, int(result.money) - int(prev_money_for_gain))
-                self.last_money = result.money
-                self.samples.append((result.ts, result.money))
-                cutoff = result.ts - 900
-                self.samples = [(t, m) for t, m in self.samples if t >= cutoff]
-                self.update_stats(result.money)
-        if self.session_id:
-            with sqlite3.connect(DB_PATH) as con:
-                con.execute("INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)", (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note))
-        if result.purpose == "stage_start":
-            if result.money is not None:
-                self.current_stage_start_gold = result.money
-                self.current_stage_start_ts = result.ts
-                self.gold_decreased_during_stage = False
-        elif result.purpose == "stage_finish":
-            self.commit_stage_from_finish_ocr(result)
+        accepted, note = self._apply_money_result(result)
+        self._persist_worker_sample(result, accepted, note)
+        self._handle_worker_purpose(result)
         # jp21: 通常OCR tickではステージ履歴を作らない。
         # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
         # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
-        debug_text = f"[{result.purpose}] 所持金: {result.money} / {result.money_raw}\nステージ/秒数: {result.stage} / {result.duration_sec}秒 / {result.stage_raw}"
-        self.raw_lbl.setText(debug_text)
-        if hasattr(self, "debug_last_lbl"):
-            self.debug_last_lbl.setText("最後のOCR: " + debug_text)
+        self._show_worker_debug(result)
         if self.running and self.stage_state == "FINISH_PENDING" and self.pending_stage_finish_ts:
             # 次イベントループで終了OCRを再試行。これが2周目以降が出ない主因だった
             # 「終了検知時に通常OCR中でFINISHINGに固まる」状態を防ぐ。
             QTimer.singleShot(80, lambda: self.finish_stage_run(float(self.pending_stage_finish_ts or time.time())))
-
-    def set_stage_window(self, seconds: int):
-        self.stage_window_sec = int(seconds)
-        self.cfg["history_window_sec"] = self.stage_window_sec
-        save_config(self.cfg)
-        self.refresh_stage_window_buttons()
-        self.refresh_stage_summary_table()
-
-    def set_history_view(self, mode: str):
-        self.history_view_mode = mode
-        self.cfg["history_view_mode"] = mode
-        save_config(self.cfg)
-        self.refresh_stage_window_buttons()
-        self.refresh_stage_summary_table()
 
     def set_stage_table_headers(self, headers: List[str]):
         translated = [self._tr(h) if hasattr(self, "_tr") else h for h in headers]
@@ -2941,155 +2852,10 @@ class MainWindow(QMainWindow):
             self.stage_table.setHorizontalHeaderLabels(translated)
             self.stage_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
-    def refresh_stage_window_buttons(self):
-        mapping = [(getattr(self, "hist_1m_btn", None), 60), (getattr(self, "hist_3m_btn", None), 180), (getattr(self, "hist_5m_btn", None), 300)]
-        for btn, sec in mapping:
-            if not btn:
-                continue
-            active = int(self.stage_window_sec) == int(sec)
-            btn.setChecked(active)
-            btn.setObjectName("toggleOn" if active else "toggleOff")
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.update()
-        for btn, mode in [(getattr(self, "hist_agg_btn", None), "agg"), (getattr(self, "hist_full_btn", None), "full")]:
-            if not btn:
-                continue
-            active = self.history_view_mode == mode
-            btn.setChecked(active)
-            btn.setObjectName("toggleOn" if active else "toggleOff")
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.update()
-
     def fixed_stage_list(self) -> List[str]:
         # 互換用。jp11では固定ステージ表ではなく、時間区切りの集計ログを表示する。
         return [f"{area}-{stage}" for area in range(1, 4) for stage in range(1, 11)]
 
-    def _bucket_label(self, bucket_index: int, bucket_sec: int) -> str:
-        start_sec = bucket_index * bucket_sec
-        end_sec = start_sec + bucket_sec
-        return f"{format_elapsed(start_sec)}-{format_elapsed(end_sec)}"
-
-    def refresh_stage_full_table(self):
-        if not hasattr(self, "stage_table"):
-            return
-        self.set_stage_table_headers(["時刻", "ステージ", "秒", "G増加", "GPS", "GPH", "生OCR"])
-        self.stage_table.setSortingEnabled(False)
-        self.stage_table.setRowCount(0)
-        if not self.session_id:
-            self.stage_table.setSortingEnabled(True)
-            return
-        try:
-            with sqlite3.connect(DB_PATH) as con:
-                rows = con.execute(
-                    """
-                    SELECT ts_iso, stage, duration_sec, COALESCE(money_delta, 0), COALESCE(mps, 0), COALESCE(mph, 0), raw_text
-                    FROM stage_runs
-                    WHERE session_id=?
-                    ORDER BY ts DESC
-                    LIMIT 300
-                    """,
-                    (self.session_id,),
-                ).fetchall()
-            for ts_iso, stage, dur, delta, gps, gph, raw in rows:
-                row = self.stage_table.rowCount()
-                self.stage_table.insertRow(row)
-                vals = [
-                    (str(ts_iso)[11:19], str(ts_iso)),
-                    (stage or "-", stage or ""),
-                    ("-" if dur is None else f"{int(dur)}", int(dur or 0)),
-                    (f"{int(delta or 0):,}", int(delta or 0)),
-                    (f"{float(gps or 0):,.2f}", float(gps or 0)),
-                    (f"{float(gph or 0):,.0f}", float(gph or 0)),
-                    (str(raw or "")[:160], str(raw or "")),
-                ]
-                for c, (text, key) in enumerate(vals):
-                    self.stage_table.setItem(row, c, SortableItem(text, key))
-        except Exception as e:
-            self.status.showMessage(f"履歴表示エラー: {e}")
-        self.stage_table.setSortingEnabled(True)
-
-    def refresh_stage_summary_table(self):
-        if not hasattr(self, "stage_table"):
-            return
-        if self.history_view_mode == "full":
-            self.refresh_stage_full_table()
-            return
-        self.set_stage_table_headers(["時間帯", "ステージ", "GPS", "GPH", "周回/h", "回数"])
-        bucket_sec = max(60, int(getattr(self, "stage_window_sec", 300)))
-        # jp11: 1分/3分/5分は「直近の移動窓」ではなく、セッション開始からの時間を
-        # bucket_secごとに区切り、その区切り内の細かいステージログを合算して表示する。
-        # 細かい周回ログは表に出さず、集計済みログだけを表示して数値の揺れを減らす。
-        rows_out: List[Tuple[int, str, str, float, float, float, int]] = []
-        if self.session_id and self.session_start_ts:
-            try:
-                with sqlite3.connect(DB_PATH) as con:
-                    raw_rows = con.execute(
-                        """
-                        SELECT ts, stage, duration_sec, COALESCE(money_delta, 0)
-                        FROM stage_runs
-                        WHERE session_id=? AND stage IS NOT NULL AND stage<>'' AND mps IS NOT NULL AND mph IS NOT NULL
-                        ORDER BY ts ASC
-                        """,
-                        (self.session_id,),
-                    ).fetchall()
-                groups: Dict[Tuple[int, str], List[float]] = {}
-                # groups[(bucket_index, stage)] = [total_sec, total_gold, count]
-                for ts, stage, duration_sec, money_delta in raw_rows:
-                    if not stage:
-                        continue
-                    try:
-                        rel = max(0.0, float(ts) - float(self.session_start_ts))
-                        bucket_index = int(rel // bucket_sec)
-                        dur = max(0.0, float(duration_sec or 0))
-                        gold = float(money_delta or 0)
-                    except Exception:
-                        continue
-                    if dur <= 0:
-                        continue
-                    key = (bucket_index, str(stage))
-                    if key not in groups:
-                        groups[key] = [0.0, 0.0, 0.0]
-                    groups[key][0] += dur
-                    groups[key][1] += gold
-                    groups[key][2] += 1.0
-                for (bucket_index, stage), (total_sec, total_gold, count) in groups.items():
-                    if total_sec <= 0 or count <= 0:
-                        continue
-                    gps = total_gold / total_sec
-                    gph = gps * 3600.0
-                    loops = (count * 3600.0) / total_sec
-                    rows_out.append((bucket_index, self._bucket_label(bucket_index, bucket_sec), stage, gps, gph, loops, int(count)))
-            except Exception:
-                pass
-        # 新しい時間帯を上に出す。同じ時間帯ではステージ順。
-        def stage_sort_key(st: str):
-            try:
-                a, b = st.split("-", 1)
-                return (int(a), int(b))
-            except Exception:
-                return (999, st)
-        rows_out.sort(key=lambda x: (-x[0], stage_sort_key(x[2])))
-        rows_out = rows_out[:200]
-
-        self.stage_table.setSortingEnabled(False)
-        self.stage_table.setRowCount(0)
-        for bucket_index, bucket_label, stage, gps, gph, loops, count in rows_out:
-            row = self.stage_table.rowCount()
-            self.stage_table.insertRow(row)
-            vals = [
-                (bucket_label, -bucket_index),
-                (stage, stage_sort_key(stage)),
-                (f"{gps:,.2f}", gps),
-                (f"{gph:,.0f}", gph),
-                (f"{loops:,.1f}", loops),
-                (f"{count}", count),
-            ]
-            for c, (text, key) in enumerate(vals):
-                item = SortableItem(text, key)
-                self.stage_table.setItem(row, c, item)
-        self.stage_table.setSortingEnabled(True)
 
 
 
@@ -3112,7 +2878,7 @@ class MainWindow(QMainWindow):
         reset.clicked.connect(self.reset_all_efficiency_scores)
         top.addWidget(reset)
         lay.addLayout(top)
-        note = QLabel("各ステージの最高効率を保存します。10件以上あるステージは外れ値を除外してハイスコアを判定します。")
+        note = QLabel("各ステージの最高効率を保存します。3件以上あるステージは外れ値を除外してハイスコアを判定します。")
         note.setObjectName("hint")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -3144,7 +2910,7 @@ class MainWindow(QMainWindow):
             self.stage_table.setSortingEnabled(True)
             return
         try:
-            with sqlite3.connect(DB_PATH) as con:
+            with db_connect() as con:
                 rows = con.execute(
                     """
                     SELECT stage, duration_sec, COALESCE(money_delta, 0), COALESCE(mps, 0), COALESCE(mph, 0), ts
@@ -3182,7 +2948,7 @@ class MainWindow(QMainWindow):
 
     def _reset_cutoff_for_stage(self, stage: str) -> float:
         try:
-            with sqlite3.connect(DB_PATH) as con:
+            with db_connect() as con:
                 row = con.execute("SELECT reset_after_ts FROM stage_highscore_resets WHERE stage=?", (stage,)).fetchone()
             return float(row[0]) if row else 0.0
         except Exception:
@@ -3192,12 +2958,12 @@ class MainWindow(QMainWindow):
         """Return filtered valid runs for one stage.
 
         Rows are tuples: (gph, gps, duration_sec, money_delta, ts).
-        If there are fewer than 10 logs, no outlier filter is applied.
-        From 10 logs onward, IQR + loose median guard removes unusually high/low OCR mistakes.
+        If there are fewer than 3 logs, no outlier filter is applied.
+        From 3 logs onward, IQR + loose median guard removes unusually high/low OCR mistakes.
         """
         cutoff = self._reset_cutoff_for_stage(stage)
         try:
-            with sqlite3.connect(DB_PATH) as con:
+            with db_connect() as con:
                 rows = con.execute(
                     """
                     SELECT COALESCE(mph,0), COALESCE(mps,0), duration_sec, money_delta, ts
@@ -3217,7 +2983,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         total_count = len(vals)
-        if total_count < 10:
+        if total_count < 3:
             return vals, total_count
         gphs = [v[0] for v in vals]
         try:
@@ -3302,7 +3068,7 @@ class MainWindow(QMainWindow):
         stage = item.text().strip()
         if not re.match(r"^\d+-\d+$", stage):
             return
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO stage_highscore_resets(stage, reset_after_ts, reset_at_iso) VALUES(?,?,?)",
                 (stage, time.time(), now_iso()),
@@ -3315,7 +3081,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "全リセット", "効率表の全ステージハイスコアをリセットしますか？") != QMessageBox.StandardButton.Yes:
             return
         now = time.time()
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             for stage in self.fixed_stage_list():
                 con.execute(
                     "INSERT OR REPLACE INTO stage_highscore_resets(stage, reset_after_ts, reset_at_iso) VALUES(?,?,?)",
@@ -3395,7 +3161,7 @@ class MainWindow(QMainWindow):
         self.stage_notice_last_seen = ts
         self.stage_notice_logged = True
         self.stage_loop_lbl.setText(f"{res.stage}  {loops_per_hour:,.1f}回")
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             con.execute(
                 "INSERT INTO stage_runs(session_id, ts, ts_iso, stage, duration_sec, money, money_delta, mps, mph, raw_text) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (self.session_id, ts, now_iso(), res.stage, dur, self.last_money, delta, gps, gph, res.raw_text),
@@ -3476,7 +3242,7 @@ class MainWindow(QMainWindow):
 
     def reset_stage_history(self):
         if self.session_id:
-            with sqlite3.connect(DB_PATH) as con:
+            with db_connect() as con:
                 con.execute("DELETE FROM stage_runs WHERE session_id=?", (self.session_id,))
         self.last_stage_key = None
         self.last_stage_logged_at = 0.0
@@ -3512,7 +3278,7 @@ class MainWindow(QMainWindow):
         EXPORT_DIR.mkdir(exist_ok=True)
         out1 = EXPORT_DIR / f"stage_runs_{self.session_id}.csv"
         out2 = EXPORT_DIR / f"money_samples_{self.session_id}.csv"
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             with out1.open("w", encoding="utf-8-sig", newline="") as f:
                 wr = csv.writer(f)
                 wr.writerow(["session_id", "ts_iso", "stage", "duration_sec", "gold", "gold_delta", "gps", "gph", "raw_text"])
