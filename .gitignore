@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+exports/
+logs/
+config.json
+*.sqlite3
+*.db
+.agents/
+.codex/
+.claude/
+.cursor/
+*.md
+!README.md
+!TBH_EFFICIENCY_LOG_SPEC.md
