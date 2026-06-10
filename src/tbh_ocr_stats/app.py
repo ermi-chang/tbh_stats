@@ -16,8 +16,8 @@ import mss
 import numpy as np
 import pytesseract
 from PIL import Image
-from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -37,8 +37,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
-    QSlider,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
 from .runtime_env import (
     DEFAULT_ANCHOR_TEMPLATE,
     DEFAULT_BOSS_TEMPLATE,
+    EXPORT_DIR,
+    USER_ASSET_DIR,
     configure_tesseract,
     db_connect,
     init_db as runtime_init_db,
@@ -62,6 +64,11 @@ from .runtime_env import (
 
 
 APP_VERSION = "1.0.0"
+DISPLAY_VERSION = f"v{APP_VERSION}"
+ASSET_DIR = USER_ASSET_DIR
+APP_CREATOR_NAME = "ermi-chang"
+APP_CREATOR_GITHUB = "https://github.com/ermi-chang"
+APP_CREATOR_BMAC = "https://buymeacoffee.com/ermichanglv"
 
 UI_LANGUAGES = {
     "ja": "日本語",
@@ -101,7 +108,6 @@ I18N = {
         "■ 停止": "■ Stop",
         "計測": "Measure",
         "効率表": "Best",
-        "範囲・OCR": "ROI/OCR",
         "所持金": "Gold",
         "増加G": "Gold +",
         "経過": "Elapsed",
@@ -122,7 +128,6 @@ I18N = {
         "ゲーム言語": "Game",
         "秒数": "Seconds",
         "ゲージ": "Gauge",
-        "通知全文": "Notice",
         "自動追従": "Auto track",
         "自動設定": "Auto setup",
         "OCRテスト": "OCR test",
@@ -138,7 +143,6 @@ I18N = {
         "通知反転": "Notice invert",
         "所持金更新": "Gold refresh",
         "軽量モード": "Light mode",
-        "プレビュー更新": "Update preview",
         "OCRテスト結果": "OCR result",
         "ステージ別ハイスコア（1-1〜3-10）": "Stage best scores (1-1 to 3-10)",
         "選択ステージリセット": "Reset selected",
@@ -159,7 +163,6 @@ I18N = {
         "■ 停止": "■ 停止",
         "計測": "记录",
         "効率表": "效率表",
-        "範囲・OCR": "范围/OCR",
         "所持金": "金币",
         "増加G": "增加G",
         "経過": "经过",
@@ -180,7 +183,6 @@ I18N = {
         "ゲーム言語": "游戏语言",
         "秒数": "秒数",
         "ゲージ": "进度条",
-        "通知全文": "通知全文",
         "自動追従": "自动追踪",
         "自動設定": "自动设置",
         "OCRテスト": "OCR测试",
@@ -196,7 +198,6 @@ I18N = {
         "通知反転": "通知反转",
         "所持金更新": "金币刷新",
         "軽量モード": "轻量模式",
-        "プレビュー更新": "更新预览",
         "OCRテスト結果": "OCR结果",
         "ステージ別ハイスコア（1-1〜3-10）": "关卡最高效率（1-1〜3-10）",
         "選択ステージリセット": "重置所选",
@@ -247,7 +248,7 @@ ROI_LABELS = {
     "stage_num": "ステージ",
     "stage_time": "秒数",
     "gauge": "進捗ゲージ",
-    "stage": "通知全文",
+    "stage": "旧通知ROI",
 }
 ROI_COLORS = {
     "anchor": "#ffcc58",
@@ -262,6 +263,7 @@ ROI_COLORS = {
 # strings. If OCR reads "1488" or "14842", keep the most plausible prefix.
 DURATION_MIN_SEC = 3
 DURATION_MAX_SEC = 900
+OCR_PREPROCESS_SCALE = 3.0
 
 # 左上ゴールドアイコンを基準にした自動ROI。
 # 基準テンプレートは assets/default_anchor_gold.png（34x28）で、
@@ -368,6 +370,23 @@ def capture_monitor(monitor_index: int) -> Image.Image:
         if monitor_index >= len(monitors):
             monitor_index = 1
         shot = sct.grab(monitors[monitor_index])
+        return Image.frombytes("RGB", shot.size, shot.rgb)
+
+
+def capture_monitor_region(monitor_index: int, roi: Tuple[int, int, int, int]) -> Image.Image:
+    with mss.mss() as sct:
+        monitors = sct.monitors
+        if monitor_index >= len(monitors):
+            monitor_index = 1
+        mon = monitors[monitor_index]
+        x, y, w, h = map(int, roi)
+        region = {
+            "left": int(mon["left"]) + max(0, x),
+            "top": int(mon["top"]) + max(0, y),
+            "width": max(1, w),
+            "height": max(1, h),
+        }
+        shot = sct.grab(region)
         return Image.frombytes("RGB", shot.size, shot.rgb)
 
 
@@ -744,16 +763,25 @@ def apply_anchor_rois(img: Image.Image, cfg: dict) -> dict:
         runtime[f"{name}_roi"] = _clamp_roi(img, roi)
     return runtime
 
-def preprocess_simple(img: Image.Image, scale: float, threshold: int, invert: bool) -> Image.Image:
+def preprocess_simple(img: Image.Image, scale: float = OCR_PREPROCESS_SCALE, threshold: int = 0, invert: bool = False) -> Image.Image:
     arr = np.array(img.convert("RGB"))
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    if scale and abs(scale - 1.0) > 0.01:
-        gray = cv2.resize(gray, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_CUBIC)
-    if threshold > 0:
+    if abs(scale - 1.0) > 0.01:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if int(threshold or 0) > 0:
         _, gray = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY)
+    else:
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     if invert:
         gray = 255 - gray
     return Image.fromarray(gray)
+
+
+def preprocess_ocr_candidates(img: Image.Image, invert: bool, fixed_thresholds: List[int]) -> List[Tuple[str, Image.Image]]:
+    candidates: List[Tuple[str, Image.Image]] = [("otsu", preprocess_simple(img, invert=invert))]
+    for threshold in fixed_thresholds:
+        candidates.append((f"t{threshold}", preprocess_simple(img, threshold=threshold, invert=invert)))
+    return candidates
 
 
 
@@ -1019,16 +1047,16 @@ def parse_duration_text(text: str) -> Optional[int]:
     return candidates[0]
 
 def _ocr_text_from_crop(crop: Image.Image, cfg: dict, whitelist: str, psm_list: List[int]) -> List[str]:
-    img = preprocess_simple(crop, cfg.get("stage_scale", 3.0), cfg.get("stage_threshold", 135), cfg.get("stage_invert", True))
     raws: List[str] = []
-    for psm in psm_list:
-        config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
-        try:
-            raw = pytesseract.image_to_string(img, config=config).strip()
-            if raw:
-                raws.append(raw)
-        except Exception as e:
-            raws.append(f"ERR:{e}")
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("stage_invert", True), [69, 100, 135, 150]):
+        for psm in psm_list:
+            config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
+            try:
+                raw = pytesseract.image_to_string(img, config=config).strip()
+                if raw:
+                    raws.append(raw)
+            except Exception as e:
+                raws.append(f"ERR:{e}")
     return raws
 
 
@@ -1066,7 +1094,7 @@ def ocr_stage_split_from_image(img: Image.Image, cfg: dict) -> StageOCRResult:
         if cand:
             duration = cand[0]
 
-    # フォールバック: 旧来の通知全文ROIも一応読む
+    # フォールバック: 旧来の通知ROIも一応読む
     if (stage is None or duration is None) and cfg.get("stage_roi"):
         full = ocr_stage_from_crop(crop_roi(img, tuple(cfg["stage_roi"])), cfg)
         raw_parts.append(f"全文{full.raw_text}")
@@ -1086,23 +1114,18 @@ def format_elapsed(seconds: float) -> str:
 
 
 def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int]) -> MoneyOCRResult:
-    img = preprocess_simple(crop, cfg.get("money_scale", 3.0), cfg.get("money_threshold", 150), cfg.get("money_invert", True))
     configs = [
         "--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789,.",
     ]
-    if not cfg.get("light_mode", True):
-        configs += [
-            "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789,.",
-            "--psm 13 --oem 3 -c tessedit_char_whitelist=0123456789,.",
-        ]
     results: List[Tuple[int, str]] = []
     raws: List[str] = []
-    for config in configs:
-        raw = pytesseract.image_to_string(img, config=config).strip()
-        money = parse_money(raw)
-        raws.append(f"{raw!r}->{money}")
-        if money is not None:
-            results.append((money, raw))
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("money_invert", True), [150, 135, 100, 69]):
+        for config in configs:
+            raw = pytesseract.image_to_string(img, config=config).strip()
+            money = parse_money(raw)
+            raws.append(f"{label}:{raw!r}->{money}")
+            if money is not None:
+                results.append((money, f"{label}:{raw}"))
     if not results:
         return MoneyOCRResult(None, " / ".join(raws))
     if last_money:
@@ -1114,28 +1137,247 @@ def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int])
 
 
 def ocr_stage_from_crop(crop: Image.Image, cfg: dict) -> StageOCRResult:
-    img = preprocess_simple(crop, cfg.get("stage_scale", 3.0), cfg.get("stage_threshold", 135), cfg.get("stage_invert", True))
     configs = [
         "--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789-ー‐秒ssec()（） .",
     ]
-    if not cfg.get("light_mode", True):
-        configs += [
-            "--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789-ー‐秒ssec()（） .",
-            "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789-ー‐秒ssec()（） .",
-        ]
     raws: List[str] = []
     candidates: List[Tuple[str, Optional[str], Optional[int]]] = []
-    for config in configs:
-        raw = pytesseract.image_to_string(img, config=config).strip()
-        stg, dur = parse_stage_result(raw)
-        raws.append(f"{raw!r}->{stg},{dur}")
-        if stg or dur:
-            candidates.append((raw, stg, dur))
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("stage_invert", True), [69, 100, 135, 150]):
+        for config in configs:
+            raw = pytesseract.image_to_string(img, config=config).strip()
+            stg, dur = parse_stage_result(raw)
+            raws.append(f"{label}:{raw!r}->{stg},{dur}")
+            if stg or dur:
+                candidates.append((f"{label}:{raw}", stg, dur))
     if not candidates:
         return StageOCRResult(None, None, " / ".join(raws))
     candidates.sort(key=lambda x: (1 if x[1] else 0, 1 if x[2] else 0), reverse=True)
     raw, stg, dur = candidates[0]
     return StageOCRResult(stg, dur, f"{raw!r} => {stg},{dur}")
+
+
+# ---------- Proposal B UI widgets ----------
+
+THEME = {
+    "bg_deep": "#0b0b0a",
+    "bg": "#141414",
+    "panel": "#1d1c1a",
+    "panel_inner": "#242018",
+    "border": "#3b3b37",
+    "border_hi": "#6b665a",
+    "gold": "#d7a642",
+    "gold_hi": "#ffd05a",
+    "tab": "#7b2418",
+    "tab_active": "#a43a1e",
+    "green": "#7ee04b",
+    "warning": "#ffb13b",
+    "red": "#ff4d3d",
+    "blue": "#35a4ff",
+    "purple": "#9a4cff",
+    "bar_gold": "#e3b33d",
+    "text": "#d8d0bf",
+    "muted": "#928878",
+}
+
+
+def _clamped_ratio(value: float, maximum: float) -> float:
+    try:
+        if maximum <= 0:
+            return 0.0
+        return max(0.0, min(1.0, float(value) / float(maximum)))
+    except Exception:
+        return 0.0
+
+
+class PixelProgressBar(QWidget):
+    def __init__(self, value: float = 0.0, maximum: float = 1.0, color: str = THEME["green"], text: str = "", parent=None):
+        super().__init__(parent)
+        self.value = float(value or 0)
+        self.maximum = float(maximum or 1)
+        self.color = QColor(color)
+        self.text = text
+        self.setMinimumHeight(12)
+
+    def sizeHint(self) -> QSize:
+        return QSize(100, 12)
+
+    def set_value(self, value: float, maximum: Optional[float] = None, text: Optional[str] = None):
+        self.value = float(value or 0)
+        if maximum is not None:
+            self.maximum = float(maximum or 1)
+        if text is not None:
+            self.text = text
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.fillRect(rect, QColor("#080807"))
+        painter.setPen(QPen(QColor(THEME["border_hi"]), 1))
+        painter.drawRect(rect)
+        ratio = _clamped_ratio(self.value, self.maximum)
+        fill = QRect(rect.x() + 2, rect.y() + 2, max(0, int((rect.width() - 3) * ratio)), max(1, rect.height() - 3))
+        painter.fillRect(fill, self.color)
+        if fill.width() > 8:
+            painter.fillRect(QRect(fill.x(), fill.y(), fill.width(), max(1, fill.height() // 3)), QColor(self.color).lighter(135))
+        if self.text:
+            painter.setPen(QColor("#f5ead1"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text)
+
+
+class RingGauge(QWidget):
+    def __init__(self, value: float = 0.0, maximum: float = 1.0, color: str = THEME["green"], parent=None):
+        super().__init__(parent)
+        self.value = float(value or 0)
+        self.maximum = float(maximum or 1)
+        self.color = QColor(color)
+        self.setMinimumSize(24, 24)
+        self.setMaximumSize(28, 28)
+
+    def sizeHint(self) -> QSize:
+        return QSize(26, 26)
+
+    def set_value(self, value: float, maximum: Optional[float] = None):
+        self.value = float(value or 0)
+        if maximum is not None:
+            self.maximum = float(maximum or 1)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        side = max(8, min(self.width(), self.height()) - 12)
+        rect = QRect((self.width() - side) // 2, (self.height() - side) // 2, side, side)
+        painter.setPen(QPen(QColor("#070706"), 4))
+        painter.drawEllipse(rect)
+        painter.setPen(QPen(QColor(THEME["border_hi"]), 2))
+        painter.drawEllipse(rect.adjusted(-3, -3, 3, 3))
+        painter.setPen(QPen(QColor("#2b2925"), 4))
+        painter.drawEllipse(rect)
+        ratio = _clamped_ratio(self.value, self.maximum)
+        painter.setPen(QPen(self.color, 4))
+        painter.drawArc(rect, 90 * 16, int(-360 * ratio * 16))
+
+
+class SemiCircleGauge(QWidget):
+    def __init__(self, value: float = 0.0, maximum: float = 1.0, color: str = THEME["bar_gold"], parent=None):
+        super().__init__(parent)
+        self.value = float(value or 0)
+        self.maximum = float(maximum or 1)
+        self.color = QColor(color)
+        self.setMinimumSize(38, 22)
+        self.setMaximumSize(44, 24)
+
+    def sizeHint(self) -> QSize:
+        return QSize(40, 22)
+
+    def set_value(self, value: float, maximum: Optional[float] = None):
+        self.value = float(value or 0)
+        if maximum is not None:
+            self.maximum = float(maximum or 1)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        rect = QRect(5, 4, max(16, self.width() - 10), max(16, (self.height() - 5) * 2))
+        painter.setPen(QPen(QColor("#2b2925"), 4))
+        painter.drawArc(rect, 180 * 16, -180 * 16)
+        painter.setPen(QPen(QColor(THEME["border_hi"]), 1))
+        painter.drawArc(rect.adjusted(-3, -3, 3, 3), 180 * 16, -180 * 16)
+        ratio = _clamped_ratio(self.value, self.maximum)
+        painter.setPen(QPen(self.color, 4))
+        painter.drawArc(rect, 180 * 16, int(-180 * ratio * 16))
+
+
+class KpiGaugeCard(QFrame):
+    def __init__(self, title: str, icon: str, gauge: QWidget, accent: str = THEME["green"], parent=None):
+        super().__init__(parent)
+        self.setObjectName("kpiCard")
+        self.accent = accent
+        self.gauge = gauge
+        self.setMinimumHeight(50)
+        self.setMaximumHeight(54)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.value_lbl = QLabel("-")
+        self.value_lbl.setObjectName("kpiValue")
+        self.value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_lbl = QLabel(f"{icon}  {title}")
+        self.title_lbl.setObjectName("kpiTitle")
+        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.aux_lbl = QLabel("")
+        self.aux_lbl.setObjectName("kpiAux")
+        self.aux_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.aux_lbl.hide()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(0)
+        lay.addWidget(self.title_lbl)
+        lay.addWidget(self.value_lbl)
+        lay.addWidget(gauge, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def set_value_text(self, text: str):
+        self.value_lbl.setText(text)
+
+    def set_aux_text(self, text: str):
+        self.aux_lbl.setText(text)
+
+
+def compact_number(value: float) -> str:
+    try:
+        value = float(value)
+    except Exception:
+        return "-"
+    if abs(value) >= 1000000:
+        return f"{value / 1000000:.1f}m"
+    if abs(value) >= 1000:
+        return f"{value / 1000:.0f}k"
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+class EfficiencyStageCell(QPushButton):
+    def __init__(self, stage: str, parent=None):
+        super().__init__(parent)
+        self.stage = stage
+        self.setObjectName("stageCell")
+        self.setCheckable(True)
+        self.setMinimumSize(68, 34)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setProperty("state", "empty")
+        self.setText(f"{stage}\n-\n○")
+
+    def set_stage_data(self, row: Optional[Tuple[float, float, int, int, int, int]], metric: str, top: bool, recommended: bool):
+        if not row:
+            self.setText(f"{self.stage}\n未計測\n○")
+            self.setProperty("state", "empty")
+            self._refresh_style()
+            return
+        gps, gph, adopted, total, dur, delta = row
+        loops = (3600.0 / dur) if dur else 0.0
+        metric_value = {
+            "gps": gps,
+            "gph": gph,
+            "delta": delta,
+            "loops": loops,
+        }.get(metric, gps)
+        icon = "♛" if top else ("◎" if recommended else "◆")
+        second = compact_number(metric_value)
+        third = f"{compact_number(gph)} GPH"
+        self.setText(f"{self.stage}\n{second}\n{third} {icon}")
+        self.setProperty("state", "top" if top else ("recommended" if recommended else "normal"))
+        self._refresh_style()
+
+    def set_selected_visual(self, selected: bool):
+        self.setChecked(bool(selected))
+        self._refresh_style()
+
+    def _refresh_style(self):
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
 
 # ---------- ROI label ----------
@@ -1280,7 +1522,7 @@ class OcrWorker(QRunnable):
                 self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", "tesseract.exe が見つかりません。OCR調整タブで tesseract.exe を指定してください。", self.purpose))
                 return
             img = capture_monitor(self.monitor_index)
-            runtime_cfg = apply_anchor_rois(img, self.cfg)
+            runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
             money_res = MoneyOCRResult(None, "所持金範囲なし")
             stage_res = StageOCRResult(None, None, "通知範囲なし")
             if runtime_cfg.get("money_roi"):
@@ -1306,8 +1548,14 @@ class GaugeWorker(QRunnable):
     def run(self):
         ts = time.time()
         try:
+            roi = self.cfg.get("gauge_roi")
+            if roi and self.cfg.get("_direct_gauge_capture"):
+                crop = capture_monitor_region(self.monitor_index, tuple(roi))
+                state, fill, blue, purple, raw = detect_gauge_state(crop, self.cfg)
+                self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
+                return
             img = capture_monitor(self.monitor_index)
-            runtime_cfg = apply_anchor_rois(img, self.cfg)
+            runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
             roi = runtime_cfg.get("gauge_roi")
             if not roi:
                 self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, runtime_cfg.get("_anchor_status", "ゲージROIなし")))
@@ -1317,53 +1565,6 @@ class GaugeWorker(QRunnable):
             self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
         except Exception as e:
             self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "", str(e)))
-
-
-class SliderSetting(QWidget):
-    valueChanged = Signal()
-
-    def __init__(self, minimum: float, maximum: float, step: float, value: float, suffix: str = ""):
-        super().__init__()
-        self.minimum = float(minimum)
-        self.maximum = float(maximum)
-        self.step = float(step)
-        self.suffix = suffix
-        self.factor = int(round(1 / self.step)) if self.step < 1 else 1
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(int(round(self.minimum * self.factor)), int(round(self.maximum * self.factor)))
-        self.label = QLabel()
-        self.label.setMinimumWidth(42)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        lay.addWidget(self.slider, 1)
-        lay.addWidget(self.label)
-        self.slider.valueChanged.connect(self._on_changed)
-        self.setValue(value)
-
-    def value(self):
-        val = self.slider.value() / self.factor
-        if self.step >= 1:
-            return int(round(val))
-        return round(val, 2)
-
-    def setValue(self, value):
-        self.slider.setValue(int(round(float(value) * self.factor)))
-        self._update_label()
-
-    def _on_changed(self, *_):
-        self._update_label()
-        self.valueChanged.emit()
-
-    def _update_label(self):
-        val = self.value()
-        if isinstance(val, int):
-            text = f"{val}"
-        else:
-            text = f"{val:.1f}".rstrip("0").rstrip(".")
-        self.label.setText(f"{text}{self.suffix}")
-
 
 
 class SortableItem(QTableWidgetItem):
@@ -1579,9 +1780,9 @@ class MainWindow(QMainWindow):
         self.cfg = load_config()
         self.ui_language = self.cfg.get("ui_language", "ja") if self.cfg.get("ui_language", "ja") in UI_LANGUAGES else "ja"
         self.game_ocr_language = self.cfg.get("game_ocr_language", "ja")
-        self.setWindowTitle(f"TBH 効率ログ {APP_VERSION}")
-        self.resize(760, 520)
-        self.setMinimumSize(700, 480)
+        self.setWindowTitle(f"TBH 効率ログ {DISPLAY_VERSION}")
+        self.resize(700, 300)
+        self.setMinimumSize(680, 280)
 
         self.current_screenshot: Optional[Image.Image] = None
         self.current_roi_target = "money"
@@ -1600,6 +1801,8 @@ class MainWindow(QMainWindow):
         self.stage_notice_last_seen = 0.0
         self.stage_notice_logged = False
         self.ocr_busy = False
+        self.pending_ocr_purpose: Optional[str] = None
+        self.runtime_cfg_cache: Optional[dict] = None
         self.packet_sniffer: Optional[PacketPulseSniffer] = None  # legacy unused
         self.stage_pulse_active_until = 0.0
         self.last_stage_pulse_at = 0.0
@@ -1619,7 +1822,7 @@ class MainWindow(QMainWindow):
 
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock_only)
-        self.clock_timer.start(250)
+        self.clock_timer.start(1000)
         self.ocr_timer = QTimer(self)
         self.ocr_timer.timeout.connect(self.request_ocr_tick)
         self.preview_timer = QTimer(self)
@@ -1637,57 +1840,151 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
-        main.setContentsMargins(5, 5, 5, 4)
-        main.setSpacing(4)
+        main.setContentsMargins(4, 3, 4, 2)
+        main.setSpacing(2)
 
-        top = QFrame()
-        top.setObjectName("topbar")
-        top_l = QHBoxLayout(top)
-        top_l.setContentsMargins(8, 5, 8, 5)
-        self.title_lbl = QLabel(f"TBH 効率ログ {APP_VERSION}")
-        self.title_lbl.setObjectName("title")
-        top_l.addWidget(self.title_lbl, 1)
+        self.tabs = QTabWidget()
+        self.tab_controls = QWidget()
+        tab_controls_l = QHBoxLayout(self.tab_controls)
+        tab_controls_l.setContentsMargins(0, 0, 0, 0)
+        tab_controls_l.setSpacing(3)
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.clicked.connect(self.start_session)
+        tab_controls_l.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("danger")
+        self.stop_btn.clicked.connect(self.stop_session)
+        tab_controls_l.addWidget(self.stop_btn)
+        settings_btn = QPushButton("⚙")
+        settings_btn.setObjectName("iconBtn")
+        settings_btn.setToolTip("設定")
+        settings_btn.clicked.connect(self.open_settings_dialog)
+        tab_controls_l.addWidget(settings_btn)
+        info_btn = QPushButton("i")
+        info_btn.setObjectName("iconBtn")
+        info_btn.setToolTip("アプリ情報")
+        info_btn.clicked.connect(self.open_app_info_dialog)
+        tab_controls_l.addWidget(info_btn)
         self.status_pill = QLabel("待機")
         self.status_pill.setObjectName("pill")
         self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top_l.addWidget(self.status_pill)
-        self.start_btn = QPushButton("▶ 開始")
-        self.start_btn.setObjectName("primary")
-        self.start_btn.clicked.connect(self.start_session)
-        top_l.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("■ 停止")
-        self.stop_btn.setObjectName("ghost")
-        self.stop_btn.clicked.connect(self.stop_session)
-        top_l.addWidget(self.stop_btn)
-        main.addWidget(top)
-
-        self.tabs = QTabWidget()
+        tab_controls_l.addWidget(self.status_pill)
+        self.tabs.setCornerWidget(self.tab_controls, Qt.Corner.TopRightCorner)
         main.addWidget(self.tabs, 1)
         self._build_home_tab()
-        self._build_efficiency_tab()
         self._build_setup_tab()
-        # 1周ごとのステージ履歴と、ステージ別効率表を分離。
+        self._build_history_tab()
+        # 1周ごとのステージ履歴と、ステージ別ハイスコア表示を同じ計測画面に集約。
 
-        self.status = QStatusBar()
-        self.status.setMaximumHeight(18)
-        self.setStatusBar(self.status)
+        self.status = QStatusBar(self)
+        self.status.hide()
+
+    def open_settings_dialog(self):
+        if not hasattr(self, "settings_tab"):
+            return
+        if not hasattr(self, "settings_dialog") or self.settings_dialog is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("設定")
+            dlg.resize(760, 500)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(6, 6, 6, 6)
+            lay.addWidget(self.settings_tab)
+            self.settings_dialog = dlg
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def open_app_info_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("アプリ情報")
+        dlg.resize(420, 220)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        title = QLabel(f"TBH 効率ログ {DISPLAY_VERSION}")
+        title.setObjectName("section")
+        creator = QLabel(
+            f'開発者: {APP_CREATOR_NAME}<br>'
+            f'<a href="{APP_CREATOR_GITHUB}">GitHub</a><br>'
+            f'<a href="{APP_CREATOR_BMAC}">Buy Me A Coffee</a><br>'
+            f'保存先: {EXPORT_DIR}'
+        )
+        creator.setObjectName("hint")
+        creator.setOpenExternalLinks(True)
+        lay.addWidget(title)
+        lay.addWidget(creator, 1)
+        close_btn = QPushButton("閉じる")
+        close_btn.setObjectName("ghost")
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+        dlg.exec()
 
     def _build_home_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(4)
-        cards = QGridLayout()
-        cards.setHorizontalSpacing(6)
-        cards.setVerticalSpacing(6)
-        self.current_money_lbl = self._card(cards, 0, 0, "所持金", "-")
-        self.gain_lbl = self._card(cards, 0, 1, "増加G", "-")
-        self.elapsed_lbl = self._card(cards, 0, 2, "経過", "-")
-        self.gps_5m_lbl = self._card(cards, 1, 0, "直近5分GPS", "-")
-        self.avg_gph_lbl = self._card(cards, 1, 1, "平均GPH", "-")
-        self.stage_loop_lbl = self._card(cards, 1, 2, "今ステージ周回/h", "-")
-        self.recommend_lbl = self._card(cards, 2, 0, "オススメ", "-")
+        lay.setContentsMargins(3, 3, 3, 2)
+        lay.setSpacing(3)
+
+        summary = QFrame()
+        summary.setObjectName("summaryBar")
+        summary.setMinimumHeight(24)
+        summary.setMaximumHeight(26)
+        summary_l = QHBoxLayout(summary)
+        summary_l.setContentsMargins(6, 1, 6, 1)
+        summary_l.setSpacing(5)
+        current_prefix = QLabel("現在 ステージ")
+        current_prefix.setObjectName("summaryItem")
+        self.current_stage_name_lbl = QLabel("-")
+        self.current_stage_name_lbl.setObjectName("summaryValue")
+        self.current_stage_state_lbl = QLabel("待機中")
+        self.current_stage_state_lbl.setObjectName("summaryBadge")
+        self.current_stage_hint_lbl = QLabel("★オススメ -")
+        self.current_stage_hint_lbl.setObjectName("recommendLine")
+        self.current_stage_hint_lbl.setWordWrap(False)
+        self.current_stage_hint_lbl.setMinimumWidth(0)
+        self.current_stage_hint_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.monitor_state_lbl = QLabel("モニター: -")
+        self.monitor_state_lbl.hide()
+        self.target_state_lbl = QLabel("ターゲット: ゲージ")
+        self.target_state_lbl.hide()
+        self.ocr_state_lbl = QLabel("OCR: 確認待ち")
+        self.ocr_state_lbl.setObjectName("summaryItem")
+        self.ocr_state_lbl.hide()
+        self.recommend_lbl = self.current_stage_hint_lbl
         self.recommend_lbl.setToolTip("現在セッションでハイスコアGPHが最も高いステージ / GPS / GPH / 周回/h")
+        summary_l.addWidget(self.current_stage_state_lbl)
+        summary_l.addWidget(current_prefix)
+        summary_l.addWidget(self.current_stage_name_lbl)
+        divider = QLabel("|")
+        divider.setObjectName("summaryItem")
+        summary_l.addWidget(divider)
+        summary_l.addWidget(self.current_stage_hint_lbl, 1)
+        lay.addWidget(summary)
+
+        cards = QGridLayout()
+        cards.setHorizontalSpacing(3)
+        cards.setVerticalSpacing(2)
+        self.money_gauge = SemiCircleGauge(color=THEME["bar_gold"])
+        self.gain_gauge = RingGauge(color=THEME["green"])
+        self.gps_gauge = RingGauge(color=THEME["green"])
+        self.avg_gph_gauge = RingGauge(color=THEME["bar_gold"])
+        self.loop_gauge = RingGauge(color=THEME["warning"])
+        self.elapsed_gauge = RingGauge(color="#55cfc1")
+        self.money_card = KpiGaugeCard("所持金", "●", self.money_gauge, THEME["bar_gold"])
+        self.gain_card = KpiGaugeCard("増加G", "+", self.gain_gauge, THEME["green"])
+        self.gps_card = KpiGaugeCard("直近5分GPS", "◆", self.gps_gauge, THEME["green"])
+        self.avg_gph_card = KpiGaugeCard("平均GPH", "◇", self.avg_gph_gauge, THEME["bar_gold"])
+        self.loop_card = KpiGaugeCard("今ステージ周回/h", "↻", self.loop_gauge, THEME["warning"])
+        self.elapsed_card = KpiGaugeCard("ステージ秒", "⌛", self.elapsed_gauge, "#55cfc1")
+        for i, card in enumerate([self.money_card, self.gain_card, self.gps_card, self.avg_gph_card, self.loop_card, self.elapsed_card]):
+            cards.addWidget(card, 0, i)
+            cards.setColumnStretch(i, 1)
+        self.current_money_lbl = self.money_card.value_lbl
+        self.gain_lbl = self.gain_card.value_lbl
+        self.elapsed_lbl = self.elapsed_card.value_lbl
+        self.gps_5m_lbl = self.gps_card.value_lbl
+        self.avg_gph_lbl = self.avg_gph_card.value_lbl
+        self.stage_loop_lbl = self.loop_card.value_lbl
         # backward-compatible aliases used by older methods/configs
         self.mph_5m_lbl = self.gps_5m_lbl
         self.avg_mph_lbl = self.avg_gph_lbl
@@ -1695,49 +1992,124 @@ class MainWindow(QMainWindow):
         self.mph_60_lbl = QLabel("-")
         lay.addLayout(cards)
 
+        self._build_recommend_dropdown(lay)
+
         row = QHBoxLayout()
-        title = QLabel("ステージ履歴（1クリア=1行）")
+        title = QLabel("履歴（直近5件）")
         title.setObjectName("section")
         row.addWidget(title)
         row.addStretch(1)
-        csv_btn = QPushButton("CSV")
-        csv_btn.setObjectName("saveBtn")
-        csv_btn.clicked.connect(self.export_csv)
-        row.addWidget(csv_btn)
-        reset = QPushButton("リセット")
-        reset.setObjectName("ghost")
-        reset.clicked.connect(self.reset_stage_history)
-        row.addWidget(reset)
         lay.addLayout(row)
 
         self.stage_table = QTableWidget(0, 6)
-        self.stage_table.setHorizontalHeaderLabels([self._tr(x) for x in ["ステージ", "秒", "増加G", "GPS", "GPH", "周回/h"]])
+        self.stage_table.setHorizontalHeaderLabels([self._tr(x) for x in ["時刻", "ステージ", "秒", "GPS", "GPH", "増加G"]])
         self.stage_table.verticalHeader().setVisible(False)
         self.stage_table.setAlternatingRowColors(True)
         self.stage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.stage_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.stage_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.stage_table.horizontalHeader().setFixedHeight(16)
         self.stage_table.setSortingEnabled(True)
         self.stage_table.setObjectName("table")
-        lay.addWidget(self.stage_table, 1)
+        self.stage_table.setMinimumHeight(76)
+        self.stage_table.setMaximumHeight(82)
+        self.stage_table.verticalHeader().setDefaultSectionSize(12)
+        lay.addWidget(self.stage_table)
+        lay.addStretch(1)
         self.tabs.addTab(tab, "計測")
         self.refresh_stage_summary_table()
+
+    def _build_recommend_dropdown(self, parent_layout: QVBoxLayout):
+        self.eff_metric = "gps"
+        self.selected_eff_stage: Optional[str] = None
+        self.eff_cells: Dict[str, EfficiencyStageCell] = {}
+        panel = QFrame()
+        panel.setObjectName("recommendFold")
+        panel_l = QVBoxLayout(panel)
+        panel_l.setContentsMargins(4, 3, 4, 4)
+        panel_l.setSpacing(3)
+
+        self.recommend_toggle_btn = QPushButton("▼ ★オススメ -")
+        self.recommend_toggle_btn.setObjectName("recommendHeader")
+        self.recommend_toggle_btn.clicked.connect(self.toggle_recommend_panel)
+        panel_l.addWidget(self.recommend_toggle_btn)
+
+        self.recommend_body = QFrame()
+        self.recommend_body.setObjectName("panel")
+        body_l = QVBoxLayout(self.recommend_body)
+        body_l.setContentsMargins(4, 3, 4, 3)
+        body_l.setSpacing(3)
+
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(3)
+        controls.setVerticalSpacing(0)
+        self.eff_metric_buttons = {}
+        for idx, (label, key) in enumerate([("GPS", "gps"), ("GPH", "gph"), ("増加G", "delta"), ("周回/h", "loops")]):
+            btn = QPushButton(label)
+            btn.setObjectName("modeActive" if key == self.eff_metric else "modeInactive")
+            btn.clicked.connect(lambda checked=False, k=key: self.set_efficiency_metric(k))
+            self.eff_metric_buttons[key] = btn
+            controls.addWidget(btn, 0, idx)
+        reset_one = QPushButton("選択リセット")
+        reset_one.setObjectName("ghost")
+        reset_one.clicked.connect(self.reset_selected_efficiency_stage)
+        controls.addWidget(reset_one, 0, 4)
+        reset_all = QPushButton("全リセット")
+        reset_all.setObjectName("ghost")
+        reset_all.clicked.connect(self.reset_all_efficiency_scores)
+        controls.addWidget(reset_all, 0, 5)
+        for col in range(6):
+            controls.setColumnStretch(col, 1)
+        body_l.addLayout(controls)
+
+        matrix = QFrame()
+        matrix.setObjectName("panel")
+        matrix_l = QVBoxLayout(matrix)
+        matrix_l.setContentsMargins(4, 3, 4, 3)
+        matrix_l.setSpacing(2)
+        for world in range(1, 4):
+            chapter = QLabel(f"{world}章  {world}-1〜{world}-10")
+            chapter.setObjectName("section")
+            matrix_l.addWidget(chapter)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(3)
+            grid.setVerticalSpacing(2)
+            for num in range(1, 11):
+                stage = f"{world}-{num}"
+                cell = EfficiencyStageCell(stage)
+                cell.clicked.connect(lambda checked=False, s=stage: self.select_efficiency_stage(s))
+                self.eff_cells[stage] = cell
+                grid.addWidget(cell, (num - 1) // 5, (num - 1) % 5)
+                grid.setColumnStretch((num - 1) % 5, 1)
+            matrix_l.addLayout(grid)
+        body_l.addWidget(matrix)
+
+        self.eff_detail_lbl = QLabel("ステージセルを選択してください。")
+        self.eff_detail_lbl.setObjectName("hint")
+        self.eff_detail_lbl.setWordWrap(False)
+        body_l.addWidget(self.eff_detail_lbl)
+        self.recommend_body.hide()
+        panel_l.addWidget(self.recommend_body)
+        parent_layout.addWidget(panel)
+        self.refresh_efficiency_table()
 
     def _build_setup_tab(self):
         tab = QWidget()
         outer = QVBoxLayout(tab)
-        outer.setContentsMargins(5, 5, 5, 5)
-        outer.setSpacing(5)
+        outer.setContentsMargins(5, 5, 5, 4)
+        outer.setSpacing(4)
 
         top = QFrame()
         top.setObjectName("panel")
+        top.setMinimumHeight(78)
+        top.setMaximumHeight(84)
         tl = QGridLayout(top)
         tl.setContentsMargins(7, 5, 7, 5)
         tl.setHorizontalSpacing(5)
         tl.setVerticalSpacing(5)
 
         self.monitor_combo = QComboBox()
-        self.monitor_combo.setMinimumWidth(300)
+        self.monitor_combo.setMinimumWidth(220)
         with mss.mss() as sct:
             for i, mon in enumerate(sct.monitors):
                 label = f"全画面 {mon['width']}x{mon['height']}" if i == 0 else f"画面{i} {mon['width']}x{mon['height']}"
@@ -1745,6 +2117,7 @@ class MainWindow(QMainWindow):
         self.monitor_label = QLabel("対象画面")
         tl.addWidget(self.monitor_label, 0, 0)
         tl.addWidget(self.monitor_combo, 0, 1, 1, 3)
+        self.monitor_combo.currentIndexChanged.connect(self.update_dashboard_environment)
 
         self.ui_lang_label = QLabel("UI言語")
         self.ui_lang_combo = QComboBox()
@@ -1759,14 +2132,14 @@ class MainWindow(QMainWindow):
 
         self.game_lang_label = QLabel("ゲーム言語")
         self.game_lang_combo = QComboBox()
-        self.game_lang_combo.setMinimumWidth(145)
+        self.game_lang_combo.setMinimumWidth(90)
         for code, label in GAME_LANGUAGES:
             self.game_lang_combo.addItem(label, code)
         g_idx = self.game_lang_combo.findData(self.cfg.get("game_ocr_language", "ja"))
         self.game_lang_combo.setCurrentIndex(max(0, g_idx))
         self.game_lang_combo.currentIndexChanged.connect(self.on_game_language_changed)
-        tl.addWidget(self.game_lang_label, 2, 1)
-        tl.addWidget(self.game_lang_combo, 2, 2, 1, 2)
+        tl.addWidget(self.game_lang_label, 2, 4)
+        tl.addWidget(self.game_lang_combo, 2, 5)
 
         self.view_scale_value = 1.0
 
@@ -1774,15 +2147,13 @@ class MainWindow(QMainWindow):
         self.stage_num_mode_btn = QPushButton("ステージ")
         self.stage_time_mode_btn = QPushButton("秒数")
         self.gauge_mode_btn = QPushButton("ゲージ")
-        self.stage_mode_btn = QPushButton("通知全文")
         for col, (btn, name) in enumerate([
             (self.money_mode_btn, "money"),
             (self.stage_num_mode_btn, "stage_num"),
             (self.stage_time_mode_btn, "stage_time"),
             (self.gauge_mode_btn, "gauge"),
-            (self.stage_mode_btn, "stage"),
         ]):
-            btn.setMinimumWidth(82)
+            btn.setMinimumWidth(70)
             btn.setObjectName("modeActive" if name == self.current_roi_target else "modeInactive")
             btn.clicked.connect(lambda checked=False, n=name: self.set_roi_target(n))
             tl.addWidget(btn, 1, col)
@@ -1806,6 +2177,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(top)
 
         state = QHBoxLayout()
+        state.setSpacing(4)
         self.roi_state_lbl = QLabel("対象: 所持金 / 自動ROI")
         self.roi_state_lbl.setObjectName("section")
         state.addWidget(self.roi_state_lbl, 1)
@@ -1814,14 +2186,18 @@ class MainWindow(QMainWindow):
         self.stage_num_saved_lbl = QLabel("ステージ: 自動")
         self.stage_time_saved_lbl = QLabel("秒数: 自動")
         self.gauge_saved_lbl = QLabel("ゲージ: 自動")
-        self.stage_saved_lbl = QLabel("通知全文: 自動")
-        for lab in [self.anchor_saved_lbl, self.money_saved_lbl, self.stage_num_saved_lbl, self.stage_time_saved_lbl, self.gauge_saved_lbl, self.stage_saved_lbl]:
+        for lab in [self.anchor_saved_lbl, self.money_saved_lbl, self.stage_num_saved_lbl, self.stage_time_saved_lbl, self.gauge_saved_lbl]:
             lab.setObjectName("hint")
+            lab.setMinimumWidth(0)
+            lab.setWordWrap(True)
+            lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             state.addWidget(lab)
         outer.addLayout(state)
 
         preview_box = QFrame()
         preview_box.setObjectName("panel")
+        preview_box.setMinimumHeight(94)
+        preview_box.setMaximumHeight(98)
         pv = QGridLayout(preview_box)
         pv.setContentsMargins(7, 5, 7, 5)
         pv.setHorizontalSpacing(6)
@@ -1832,14 +2208,38 @@ class MainWindow(QMainWindow):
         for lab in [self.orig_preview, self.proc_preview]:
             lab.setObjectName("preview")
             lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lab.setMinimumSize(300, 92)
-            lab.setMaximumHeight(150)
+            lab.setMinimumSize(180, 54)
+            lab.setMaximumHeight(58)
         pv.addWidget(self.orig_preview, 1, 0)
         pv.addWidget(self.proc_preview, 1, 1)
         outer.addWidget(preview_box)
 
+        self.gauge_info_panel = QFrame()
+        self.gauge_info_panel.setObjectName("panel")
+        self.gauge_info_panel.setMaximumHeight(58)
+        gauge_info_l = QGridLayout(self.gauge_info_panel)
+        gauge_info_l.setContentsMargins(7, 5, 7, 5)
+        gauge_info_l.setHorizontalSpacing(10)
+        gauge_info_l.setVerticalSpacing(4)
+        gauge_title = QLabel("ゲージ検出情報")
+        gauge_title.setObjectName("section")
+        self.gauge_roi_info_lbl = QLabel("ROI: -")
+        self.gauge_value_info_lbl = QLabel("値: -")
+        self.gauge_ratio_info_lbl = QLabel("fill: - / blue: - / purple: -")
+        self.gauge_state_info_lbl = QLabel("状態: -")
+        for lab in [self.gauge_roi_info_lbl, self.gauge_value_info_lbl, self.gauge_ratio_info_lbl, self.gauge_state_info_lbl]:
+            lab.setObjectName("statusLine")
+        gauge_info_l.addWidget(gauge_title, 0, 0, 1, 2)
+        gauge_info_l.addWidget(self.gauge_roi_info_lbl, 1, 0)
+        gauge_info_l.addWidget(self.gauge_value_info_lbl, 1, 1)
+        gauge_info_l.addWidget(self.gauge_ratio_info_lbl, 2, 0)
+        gauge_info_l.addWidget(self.gauge_state_info_lbl, 2, 1)
+        outer.addWidget(self.gauge_info_panel)
+
         settings = QFrame()
         settings.setObjectName("panel")
+        settings.setMinimumHeight(86)
+        settings.setMaximumHeight(92)
         grid = QGridLayout(settings)
         grid.setContentsMargins(7, 5, 7, 5)
         grid.setHorizontalSpacing(8)
@@ -1853,65 +2253,67 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.tess_path, 0, 1, 1, 4)
         grid.addWidget(browse, 0, 5)
 
-        self.money_scale_spin = SliderSetting(1.0, 6.0, 0.5, self.cfg.get("money_scale", 3.0), suffix="x")
-        self.money_threshold_spin = SliderSetting(0, 255, 1, self.cfg.get("money_threshold", 150))
         self.money_invert_check = QCheckBox("所持金反転")
         self.money_invert_check.setChecked(bool(self.cfg.get("money_invert", True)))
-        self.money_scale_label = QLabel("所持金 拡大")
-        self.money_threshold_label = QLabel("所持金 しきい値")
-        grid.addWidget(self.money_scale_label, 1, 0)
-        grid.addWidget(self.money_scale_spin, 1, 1, 1, 2)
-        grid.addWidget(self.money_threshold_label, 1, 3)
-        grid.addWidget(self.money_threshold_spin, 1, 4)
-        grid.addWidget(self.money_invert_check, 1, 5)
-        self.money_setting_widgets = [self.money_scale_label, self.money_scale_spin, self.money_threshold_label, self.money_threshold_spin, self.money_invert_check]
+        grid.addWidget(self.money_invert_check, 1, 0, 1, 2)
+        self.money_setting_widgets = [self.money_invert_check]
 
-        self.stage_scale_spin = SliderSetting(1.0, 6.0, 0.5, self.cfg.get("stage_scale", 3.0), suffix="x")
-        self.stage_threshold_spin = SliderSetting(0, 255, 1, self.cfg.get("stage_threshold", 135))
         self.stage_invert_check = QCheckBox("通知反転")
         self.stage_invert_check.setChecked(bool(self.cfg.get("stage_invert", True)))
-        self.stage_scale_label = QLabel("通知系 拡大")
-        self.stage_threshold_label = QLabel("通知系 しきい値")
-        grid.addWidget(self.stage_scale_label, 2, 0)
-        grid.addWidget(self.stage_scale_spin, 2, 1, 1, 2)
-        grid.addWidget(self.stage_threshold_label, 2, 3)
-        grid.addWidget(self.stage_threshold_spin, 2, 4)
-        grid.addWidget(self.stage_invert_check, 2, 5)
-        self.stage_setting_widgets = [self.stage_scale_label, self.stage_scale_spin, self.stage_threshold_label, self.stage_threshold_spin, self.stage_invert_check]
+        grid.addWidget(self.stage_invert_check, 2, 0, 1, 2)
+        self.stage_setting_widgets = [self.stage_invert_check]
 
-        for widget in [self.money_scale_spin, self.money_threshold_spin, self.stage_scale_spin, self.stage_threshold_spin]:
-            widget.valueChanged.connect(self.schedule_ocr_preview)
         self.money_invert_check.stateChanged.connect(self.schedule_ocr_preview)
         self.stage_invert_check.stateChanged.connect(self.schedule_ocr_preview)
-        # 読取間隔が長すぎると、1周分のゴールド取得が分割記録されやすい。
-        # 実測で安定した 3.5秒を上限/推奨値にする。
-        self.interval_spin = SliderSetting(1.0, 10.0, 0.5, float(self.cfg.get("poll_interval", 5.0) or 5.0), suffix="秒")
-        self.light_mode_check = QCheckBox("軽量モード")
-        self.light_mode_check.setChecked(bool(self.cfg.get("light_mode", True)))
-        self.interval_label = QLabel("所持金更新")
-        grid.addWidget(self.interval_label, 3, 0)
-        grid.addWidget(self.interval_spin, 3, 1, 1, 2)
-        grid.addWidget(self.light_mode_check, 3, 3, 1, 1)
-        self.money_update_widgets = [self.interval_label, self.interval_spin, self.light_mode_check]
-        self.preview_refresh_btn = QPushButton("プレビュー更新")
-        self.preview_refresh_btn.setObjectName("ghost")
-        self.preview_refresh_btn.clicked.connect(self.update_ocr_preview)
-        grid.addWidget(self.preview_refresh_btn, 3, 4, 1, 2)
+        creator_title = QLabel("アプリ開発者情報")
+        creator_title.setObjectName("section")
+        self.creator_info_lbl = QLabel(
+            f'{APP_CREATOR_NAME}  /  <a href="{APP_CREATOR_GITHUB}">GitHub</a>  /  '
+            f'<a href="{APP_CREATOR_BMAC}">Buy Me A Coffee</a>'
+        )
+        self.creator_info_lbl.setObjectName("hint")
+        self.creator_info_lbl.setOpenExternalLinks(True)
+        grid.addWidget(creator_title, 3, 0)
+        grid.addWidget(self.creator_info_lbl, 3, 1, 1, 5)
         outer.addWidget(settings)
 
         self.raw_lbl = QLabel("OCRテスト結果")
         self.raw_lbl.setObjectName("raw")
         self.raw_lbl.setWordWrap(True)
-        self.raw_lbl.setMaximumHeight(80)
+        self.raw_lbl.setMaximumHeight(42)
         outer.addWidget(self.raw_lbl)
-        outer.addStretch(1)
-        self.tabs.addTab(tab, "範囲・OCR")
+        self.settings_tab = tab
 
     def _build_history_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setContentsMargins(5, 5, 5, 4)
+        lay.setSpacing(4)
+
+        summary = QFrame()
+        summary.setObjectName("pixelPanel")
+        summary.setMinimumHeight(78)
+        summary.setMaximumHeight(82)
+        summary_l = QGridLayout(summary)
+        summary_l.setContentsMargins(6, 4, 6, 4)
+        summary_l.setHorizontalSpacing(6)
+        summary_l.setVerticalSpacing(2)
+        title = QLabel("セッション概要")
+        title.setObjectName("panelTitle")
+        summary_l.addWidget(title, 0, 0, 1, 6)
+        self.session_start_lbl = QLabel("開始時刻: -")
+        self.session_elapsed_lbl = QLabel("経過時間: -")
+        self.session_gain_lbl = QLabel("総増加G: -")
+        self.session_avg_gph_lbl = QLabel("平均GPH: -")
+        self.session_runs_lbl = QLabel("総周回数: -")
+        self.session_accept_lbl = QLabel("受理/全体: -")
+        for i, lab in enumerate([self.session_start_lbl, self.session_elapsed_lbl, self.session_gain_lbl, self.session_avg_gph_lbl, self.session_runs_lbl, self.session_accept_lbl]):
+            lab.setObjectName("statusLine")
+            summary_l.addWidget(lab, 1 + i // 3, i % 3)
+        lay.addWidget(summary)
+
         controls = QHBoxLayout()
+        controls.setSpacing(4)
         reset = QPushButton("基準リセット")
         reset.setObjectName("neutral")
         reset.clicked.connect(self.reset_baseline)
@@ -1924,55 +2326,284 @@ class MainWindow(QMainWindow):
         export.setObjectName("saveBtn")
         export.clicked.connect(self.export_csv)
         controls.addWidget(export)
+        open_folder = QPushButton("保存先を開く")
+        open_folder.setObjectName("ghost")
+        open_folder.clicked.connect(self.open_export_folder)
+        controls.addWidget(open_folder)
         controls.addStretch(1)
         lay.addLayout(controls)
-        note = QLabel("履歴・デバッグ: リセット、CSV出力、最後のOCR生ログ確認を行います。数値がズレる場合はCSVを出して確認できます。")
-        note.setObjectName("hint")
-        note.setWordWrap(True)
-        lay.addWidget(note)
+        log_title = QLabel("履歴（直近10件）")
+        log_title.setObjectName("section")
+        lay.addWidget(log_title)
+        self.log_stage_table = QTableWidget(0, 6)
+        self.log_stage_table.setHorizontalHeaderLabels([self._tr(x) for x in ["時刻", "ステージ", "秒", "GPS", "GPH", "増加G"]])
+        self.log_stage_table.verticalHeader().setVisible(False)
+        self.log_stage_table.setAlternatingRowColors(True)
+        self.log_stage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.log_stage_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.log_stage_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.log_stage_table.setSortingEnabled(True)
+        self.log_stage_table.setObjectName("table")
+        self.log_stage_table.setMinimumHeight(150)
+        self.log_stage_table.setMaximumHeight(154)
+        self.log_stage_table.verticalHeader().setDefaultSectionSize(18)
+        lay.addWidget(self.log_stage_table, 2)
         self.debug_last_lbl = QLabel("最後のOCR: -")
         self.debug_last_lbl.setObjectName("raw")
         self.debug_last_lbl.setWordWrap(True)
-        lay.addWidget(self.debug_last_lbl)
-        lay.addStretch(1)
-        self.tabs.addTab(tab, "履歴")
+        self.debug_last_lbl.setMinimumHeight(54)
+        self.debug_last_lbl.setMaximumHeight(58)
+        lay.addWidget(self.debug_last_lbl, 1)
+        self.tabs.addTab(tab, "セッション / ログ")
+        self.refresh_session_log_table()
 
     def _apply_theme(self):
         self.setStyleSheet(r'''
-            QMainWindow, QWidget { background:#d4d2ce; color:#242424; font-family:"Yu Gothic UI","Meiryo",sans-serif; font-size:11px; }
-            #topbar { background:#5f5b56; border-radius:7px; }
-            #title { color:#f7f2e9; font-size:15px; font-weight:850; background:transparent; }
-            #pill { background:#d88934; color:#fff8ec; border-radius:9px; padding:3px 8px; font-weight:800; }
-            QTabWidget::pane { border:0; margin-top:2px; }
-            QTabBar::tab { background:#aaa59d; color:#393531; border-radius:7px; padding:5px 10px; margin-right:3px; font-weight:800; }
-            QTabBar::tab:selected { background:#6f6860; color:#fff7eb; }
-            #panel, #miniCard { background:#e1dfda; border:1px solid #aaa6a0; border-radius:7px; }
-            #section { font-size:12px; font-weight:850; color:#2e2b28; background:transparent; }
-            #hint { color:#5b5650; background:transparent; }
-            #miniTitle { color:#686159; font-size:10px; background:transparent; }
-            #miniValue { color:#111; font-size:16px; font-weight:900; background:transparent; }
-            QPushButton { border:0; border-radius:6px; padding:3px 8px; font-weight:850; min-height:18px; }
-            #primary { background:#d87423; color:#fff7ef; }
-            #saveBtn { background:#a76b34; color:#fff7ef; }
-            #testBtn { background:#d88934; color:#fff7ef; }
-            #neutral { background:#b9b4ab; color:#302c28; }
-            #ghost { background:#b9b4ab; color:#302c28; }
-            #modeInactive { background:#a7a19a; color:#292622; border:1px solid #918b84; }
-            #modeActive { background:#d88934; color:#fff8ec; border:2px solid #6f4a2c; }
-            #toggleOff { background:#aaa59d; color:#2c2925; border:1px solid #938d85; }
-            #toggleOn { background:#6f6860; color:#fff7eb; border:2px solid #d88934; }
-            QComboBox, QLineEdit { background:#ece9e3; border:1px solid #a8a299; border-radius:6px; padding:3px 5px; }
-            QSlider { background:transparent; }
-            QSlider::groove:horizontal { height:5px; background:#aaa39a; border-radius:3px; }
-            QSlider::handle:horizontal { background:#d88934; width:14px; margin:-5px 0; border-radius:7px; }
-            QSlider::sub-page:horizontal { background:#8b6a4b; border-radius:3px; }
+            QMainWindow, QWidget {
+                background:#141414;
+                color:#d8d0bf;
+                font-family:"Meiryo UI","Yu Gothic UI",sans-serif;
+                font-size:10px;
+            }
+            #pill {
+                background:#153a12;
+                color:#7ee04b;
+                border:1px solid #2f7a25;
+                padding:1px 5px;
+                font-weight:900;
+                min-width:42px;
+            }
+            QTabWidget::pane {
+                border:2px solid #3b3b37;
+                border-top-color:#6b665a;
+                background:#0b0b0a;
+                margin-top:2px;
+            }
+            QTabBar::tab {
+                background:#242018;
+                color:#c8b58a;
+                border:2px solid #3b3b37;
+                border-bottom-color:#1d1c1a;
+                padding:3px 9px;
+                margin-right:1px;
+                font-weight:900;
+            }
+            QTabBar::tab:selected {
+                background:#a43a1e;
+                color:#ffd05a;
+                border-color:#d7a642;
+            }
+            #panel, #pixelPanel, #miniCard, #kpiCard {
+                background:#1d1c1a;
+                border:2px solid #3b3b37;
+                border-top-color:#6b665a;
+                border-left-color:#6b665a;
+            }
+            #summaryBar {
+                background:#1d1c1a;
+                border:2px solid #3b3b37;
+                border-top-color:#6b665a;
+                border-left-color:#6b665a;
+            }
+            #summaryItem {
+                color:#d7a642;
+                background:transparent;
+                font-weight:900;
+            }
+            #summaryValue {
+                color:#f5ead1;
+                background:transparent;
+                font-family:"Consolas","Meiryo UI";
+                font-weight:900;
+            }
+            #recommendLine {
+                color:#f5ead1;
+                background:transparent;
+                font-family:"Consolas","Meiryo UI";
+                font-size:11px;
+                font-weight:900;
+            }
+            #summaryBadge {
+                color:#ffd05a;
+                background:#4b1c59;
+                border:1px solid #9a4cff;
+                padding:0 4px;
+                font-weight:900;
+            }
+            #recommendFold {
+                background:#151412;
+                border:2px solid #3b3b37;
+                border-top-color:#6b665a;
+                border-left-color:#6b665a;
+            }
+            #recommendHeader {
+                background:#242018;
+                color:#ffd05a;
+                border:1px solid #7b2418;
+                text-align:left;
+                font-size:11px;
+                padding:1px 6px;
+            }
+            #footerBar {
+                background:#0b0b0a;
+                border:1px solid #3b3b37;
+            }
+            #section, #panelTitle {
+                font-size:11px;
+                font-weight:900;
+                color:#d7a642;
+                background:transparent;
+            }
+            #hint, #statusLine {
+                color:#c5bca8;
+                background:transparent;
+            }
+            #statusLine {
+                font-family:"Consolas","Meiryo UI";
+            }
+            #stageName {
+                color:#f5ead1;
+                font-size:13px;
+                font-weight:900;
+                background:#242018;
+                border:1px solid #3b3b37;
+                padding:2px 4px;
+            }
+            #stageBadge {
+                color:#ffd05a;
+                background:#4b1c59;
+                border:1px solid #9a4cff;
+                padding:1px 5px;
+                font-weight:900;
+            }
+            #largePixelIcon {
+                color:#ffd05a;
+                background:#0b0b0a;
+                border:2px solid #3b3b37;
+                min-width:32px;
+                min-height:32px;
+                font-size:18px;
+                font-weight:900;
+            }
+            #kpiTitle {
+                color:#d7a642;
+                font-size:8px;
+                font-weight:900;
+                background:transparent;
+            }
+            #kpiValue {
+                color:#f7f2e9;
+                font-family:"Consolas","Cascadia Mono","Meiryo UI";
+                font-size:11px;
+                font-weight:900;
+                background:transparent;
+            }
+            #kpiAux {
+                color:#928878;
+                font-size:0px;
+                background:transparent;
+            }
+            #miniTitle { color:#928878; font-size:10px; background:transparent; }
+            #miniValue { color:#f7f2e9; font-size:16px; font-weight:900; background:transparent; }
+            QPushButton {
+                background:#6a3514;
+                color:#ffd05a;
+                border:2px solid #3b2a18;
+                border-top-color:#9b6a2a;
+                border-left-color:#9b6a2a;
+                padding:1px 6px;
+                font-weight:900;
+                min-height:15px;
+            }
+            QPushButton:hover { background:#8a451a; }
+            QPushButton:pressed {
+                background:#3a1c0c;
+                border-top-color:#1d1008;
+                border-left-color:#1d1008;
+            }
+            #primary { background:#2f7a25; color:#eaffd8; }
+            #danger { background:#9a2a1d; color:#ffe5df; }
+            #saveBtn { background:#7b2418; color:#ffd05a; }
+            #testBtn { background:#6a3514; color:#ffd05a; }
+            #neutral { background:#242018; color:#d8d0bf; }
+            #ghost { background:#242018; color:#d8d0bf; }
+            #iconBtn {
+                background:#1d1c1a;
+                color:#ffd05a;
+                min-width:20px;
+                max-width:28px;
+                padding:1px 3px;
+            }
+            #modeInactive { background:#242018; color:#c8b58a; border:2px solid #3b3b37; }
+            #modeActive { background:#a43a1e; color:#ffd05a; border:2px solid #d7a642; }
+            QPushButton#stageCell {
+                background:#151412;
+                color:#d8d0bf;
+                border:2px solid #3b3b37;
+                padding:1px 2px;
+                font-family:"Consolas","Meiryo UI";
+                font-size:9px;
+                font-weight:900;
+                text-align:center;
+            }
+            QPushButton#stageCell[state="empty"] {
+                color:#6f7f88;
+                border-color:#2f3d44;
+            }
+            QPushButton#stageCell[state="normal"] {
+                color:#d8d0bf;
+                border-color:#3b3b37;
+            }
+            QPushButton#stageCell[state="recommended"] {
+                color:#ffd05a;
+                border-color:#d7a642;
+                background:#242018;
+            }
+            QPushButton#stageCell[state="top"] {
+                color:#ffd05a;
+                border-color:#d7a642;
+                background:#2d2110;
+            }
+            QPushButton#stageCell:checked {
+                background:#7b2418;
+                color:#ffd05a;
+                border-color:#ffd05a;
+            }
+            #toggleOff { background:#242018; color:#c8b58a; border:1px solid #3b3b37; }
+            #toggleOn { background:#7b2418; color:#ffd05a; border:2px solid #d7a642; }
+            QComboBox, QLineEdit {
+                background:#0b0b0a;
+                color:#f5ead1;
+                border:2px solid #3b3b37;
+                padding:2px 5px;
+            }
             QCheckBox { background:transparent; }
-            #imageScroll { background:#aaa7a1; border:1px solid #918d86; border-radius:7px; }
-            #preview { background:#2f2f2f; color:#eee; border:1px solid #8e887f; border-radius:6px; }
-            #raw { background:#e5e2dc; border:1px solid #aaa49a; border-radius:7px; padding:5px; color:#302c28; }
-            #table { background:#e8e5df; alternate-background-color:#ddd9d0; border:1px solid #aaa49a; border-radius:7px; }
-            QHeaderView::section { background:#706860; color:#fff7eb; border:0; padding:4px; font-weight:850; }
-            QStatusBar { background:#d4d2ce; color:#5f5952; }
+            #saveState { color:#7ee04b; background:transparent; font-weight:900; }
+            #imageScroll { background:#0b0b0a; border:2px solid #3b3b37; }
+            #preview { background:#070706; color:#eee; border:2px solid #3b3b37; }
+            #raw { background:#0b0b0a; border:2px solid #3b3b37; padding:6px; color:#d8d0bf; }
+            #table {
+                background:#11100f;
+                alternate-background-color:#191714;
+                color:#d8d0bf;
+                border:2px solid #3b3b37;
+                gridline-color:#3b3b37;
+                selection-background-color:#7b2418;
+                selection-color:#ffd05a;
+            }
+            QTableWidget::item { padding:0px 2px; }
+            QHeaderView::section {
+                background:#242018;
+                color:#d7a642;
+                border:1px solid #3b3b37;
+                padding:1px 2px;
+                font-weight:900;
+            }
+            QStatusBar {
+                background:#0b0b0a;
+                color:#c5bca8;
+                border-top:1px solid #3b3b37;
+            }
         ''')
 
     def _card(self, grid: QGridLayout, row: int, col: int, title: str, value: str) -> QLabel:
@@ -2015,6 +2646,7 @@ class MainWindow(QMainWindow):
         self.cfg["ui_language"] = self.ui_language
         save_config(self.cfg)
         self.apply_ui_language()
+        self.update_dashboard_environment()
 
     def on_game_language_changed(self):
         try:
@@ -2031,6 +2663,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Game OCR language: {label} / number-first")
         except Exception:
             pass
+        self.update_dashboard_environment()
 
     def _tr(self, key: str) -> str:
         return ui_text(key, getattr(self, "ui_language", "ja"))
@@ -2039,9 +2672,9 @@ class MainWindow(QMainWindow):
         """Translate visible UI labels without changing the game OCR language."""
         lang = getattr(self, "ui_language", self.cfg.get("ui_language", "ja"))
         try:
-            self.setWindowTitle(f"{self._tr('TBH 効率ログ')} {APP_VERSION}")
+            self.setWindowTitle(f"{self._tr('TBH 効率ログ')} {DISPLAY_VERSION}")
             if hasattr(self, "title_lbl"):
-                self.title_lbl.setText(f"{self._tr('TBH 効率ログ')} {APP_VERSION}")
+                self.title_lbl.setText(f"{self._tr('TBH 効率ログ')} {DISPLAY_VERSION}")
         except Exception:
             pass
         # Translate direct text widgets by reverse lookup; dynamic numeric labels stay untouched.
@@ -2071,7 +2704,7 @@ class MainWindow(QMainWindow):
 
     def translate_table_headers(self):
         lang = getattr(self, "ui_language", "ja")
-        for table_name in ["stage_table", "eff_table"]:
+        for table_name in ["stage_table", "eff_table", "log_stage_table"]:
             table = getattr(self, table_name, None)
             if table is None:
                 continue
@@ -2091,22 +2724,130 @@ class MainWindow(QMainWindow):
             save_config(self.cfg)
         self.monitor_combo.setCurrentIndex(int(self.cfg.get("monitor_index", 1)) if self.monitor_combo.count() > 1 else 0)
         self.refresh_roi_state()
+        self.update_dashboard_environment()
+        self.update_footer_links()
+
+    def update_dashboard_environment(self):
+        if not hasattr(self, "monitor_state_lbl"):
+            return
+        try:
+            self.monitor_state_lbl.setText(f"モニター: {self.monitor_combo.currentText()}")
+        except Exception:
+            self.monitor_state_lbl.setText("モニター: -")
+        try:
+            if hasattr(self, "game_lang_state_lbl"):
+                self.game_lang_state_lbl.setText(f"ゲーム言語: {dict(GAME_LANGUAGES).get(self.game_ocr_language, self.game_ocr_language)}")
+            if hasattr(self, "ui_lang_state_lbl"):
+                self.ui_lang_state_lbl.setText(f"UI言語: {UI_LANGUAGES.get(self.ui_language, self.ui_language)}")
+        except Exception:
+            pass
+        tess_ok = bool(self.cfg.get("tesseract_path") and Path(str(self.cfg.get("tesseract_path"))).exists())
+        self.ocr_state_lbl.setText("OCR 正常" if tess_ok else "OCR 未設定")
+
+    def update_footer_links(self):
+        return
+
+    def update_session_summary_labels(self):
+        if not hasattr(self, "session_start_lbl"):
+            return
+        if not self.session_id or not self.session_start_ts:
+            self.session_start_lbl.setText("開始時刻: -")
+            self.session_elapsed_lbl.setText("経過時間: -")
+            self.session_gain_lbl.setText("総増加G: -")
+            self.session_avg_gph_lbl.setText("平均GPH: -")
+            self.session_runs_lbl.setText("総周回数: -")
+            self.session_accept_lbl.setText("受理/全体: -")
+            return
+        elapsed = max(0.001, time.time() - self.session_start_ts)
+        gain = int(max(0, getattr(self, "session_positive_gain", 0)))
+        avg_gph = gain / elapsed * 3600.0
+        try:
+            start_text = datetime.fromtimestamp(float(self.session_start_ts)).strftime("%Y/%m/%d %H:%M:%S")
+        except Exception:
+            start_text = "-"
+        runs = 0
+        accepted = 0
+        total = 0
+        try:
+            with db_connect() as con:
+                runs = int(con.execute("SELECT COUNT(*) FROM stage_runs WHERE session_id=?", (self.session_id,)).fetchone()[0] or 0)
+                row = con.execute("SELECT COALESCE(SUM(accepted),0), COUNT(*) FROM samples WHERE session_id=?", (self.session_id,)).fetchone()
+                accepted, total = int(row[0] or 0), int(row[1] or 0)
+        except Exception:
+            pass
+        self.session_start_lbl.setText(f"開始時刻: {start_text}")
+        self.session_elapsed_lbl.setText(f"経過時間: {format_elapsed(elapsed)}")
+        self.session_gain_lbl.setText(f"総増加G: +{gain:,} G")
+        self.session_avg_gph_lbl.setText(f"平均GPH: {avg_gph:,.0f}")
+        self.session_runs_lbl.setText(f"総周回数: {runs:,}")
+        self.session_accept_lbl.setText(f"受理/全体: {accepted:,} / {total:,}")
+
+    def refresh_session_log_table(self):
+        if not hasattr(self, "log_stage_table"):
+            return
+        self.log_stage_table.setSortingEnabled(False)
+        self.log_stage_table.setRowCount(0)
+        if not self.session_id:
+            self.log_stage_table.setSortingEnabled(True)
+            return
+        try:
+            with db_connect() as con:
+                rows = con.execute(
+                    """
+                    SELECT stage, duration_sec, COALESCE(money_delta, 0), COALESCE(mps, 0), COALESCE(mph, 0), ts
+                    FROM stage_runs
+                    WHERE session_id=?
+                    ORDER BY ts DESC
+                    LIMIT 10
+                    """,
+                    (self.session_id,),
+                ).fetchall()
+            max_gps = max([float(r[3] or 0) for r in rows] + [1.0])
+            max_gph = max([float(r[4] or 0) for r in rows] + [1.0])
+            for stage, dur, delta, gps, gph, ts in rows:
+                row = self.log_stage_table.rowCount()
+                self.log_stage_table.insertRow(row)
+                loops = (3600 / float(dur)) if dur else 0.0
+                try:
+                    time_text = datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+                except Exception:
+                    time_text = "-"
+                vals = [
+                    (time_text, float(ts or 0)),
+                    (stage or "-", self._stage_sort_key(stage or "")),
+                    ("-" if not dur else f"{int(dur)}", int(dur or 0)),
+                    ("-" if not gps else f"{float(gps):,.2f}", float(gps or 0)),
+                    ("-" if not gph else f"{float(gph):,.0f}", float(gph or 0)),
+                    (f"+{int(delta or 0):,} G", int(delta or 0)),
+                ]
+                for c, (text, key) in enumerate(vals):
+                    self.log_stage_table.setItem(row, c, SortableItem(text, key))
+                if gps:
+                    self.log_stage_table.setCellWidget(row, 3, PixelProgressBar(float(gps), max_gps, THEME["green"], f"{float(gps):,.0f}"))
+                if gph:
+                    self.log_stage_table.setCellWidget(row, 4, PixelProgressBar(float(gph), max_gph, THEME["bar_gold"], f"{float(gph):,.0f}"))
+        except Exception as e:
+            self.status.showMessage(f"ログ表示エラー: {e}")
+        self.log_stage_table.setSortingEnabled(True)
 
     def build_runtime_cfg(self) -> dict:
         cfg = dict(self.cfg)
+        for key in [
+            "money_scale",
+            "money_threshold",
+            "stage_scale",
+            "stage_threshold",
+            "poll_interval",
+            "light_mode",
+        ]:
+            cfg.pop(key, None)
         tess_input = self.tess_path.text().strip().strip('"')
         if not tess_input or not Path(tess_input).exists():
             tess_input = find_tesseract() or tess_input
         cfg.update({
             "tesseract_path": tess_input,
-            "money_scale": self.money_scale_spin.value(),
-            "money_threshold": self.money_threshold_spin.value(),
             "money_invert": self.money_invert_check.isChecked(),
-            "stage_scale": self.stage_scale_spin.value(),
-            "stage_threshold": self.stage_threshold_spin.value(),
             "stage_invert": self.stage_invert_check.isChecked(),
-            "poll_interval": float(self.interval_spin.value()),
-            "light_mode": self.light_mode_check.isChecked(),
             "monitor_index": self.monitor_combo.currentIndex(),
             "ui_language": getattr(self, "ui_language", cfg.get("ui_language", "ja")),
             "game_ocr_language": getattr(self, "game_ocr_language", cfg.get("game_ocr_language", "ja")),
@@ -2130,6 +2871,8 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         self.sync_runtime_cfg_from_ui()
         save_config(self.cfg)
+        self.update_footer_links()
+        self.update_dashboard_environment()
 
     def sync_runtime_cfg_from_ui(self):
         self.cfg = self.build_runtime_cfg()
@@ -2149,13 +2892,11 @@ class MainWindow(QMainWindow):
             self.stage_time_saved_lbl.setText("秒数: 自動")
             if hasattr(self, "gauge_saved_lbl"):
                 self.gauge_saved_lbl.setText("ゲージ: 自動")
-            self.stage_saved_lbl.setText("通知全文: 自動")
             buttons = {
                 "money": self.money_mode_btn,
                 "stage_num": self.stage_num_mode_btn,
                 "stage_time": self.stage_time_mode_btn,
                 "gauge": self.gauge_mode_btn,
-                "stage": self.stage_mode_btn,
             }
             for name, btn in buttons.items():
                 btn.setObjectName("modeActive" if self.current_roi_target == name else "modeInactive")
@@ -2173,13 +2914,13 @@ class MainWindow(QMainWindow):
         """Show only the OCR settings relevant to the selected target."""
         is_money = self.current_roi_target == "money"
         is_stage_like = self.current_roi_target in ("stage_num", "stage_time", "stage")
+        is_gauge = self.current_roi_target == "gauge"
         for w in getattr(self, "money_setting_widgets", []):
             w.setVisible(is_money)
         for w in getattr(self, "stage_setting_widgets", []):
             w.setVisible(is_stage_like)
-        # 所持金更新間隔は所持金OCR専用。ゲージ/ステージ/秒数/通知全文では非表示にする。
-        for w in getattr(self, "money_update_widgets", []):
-            w.setVisible(is_money)
+        if hasattr(self, "gauge_info_panel"):
+            self.gauge_info_panel.setVisible(is_gauge)
         if hasattr(self, "orig_preview"):
             if self.current_roi_target == "stage_num":
                 self.orig_preview.setToolTip("ステージ番号のみの自動範囲を表示します。")
@@ -2187,6 +2928,35 @@ class MainWindow(QMainWindow):
                 self.orig_preview.setToolTip("秒数のみの自動範囲を表示します。")
             else:
                 self.orig_preview.setToolTip("")
+        if is_gauge:
+            self.update_gauge_detection_info()
+
+    def update_gauge_detection_info(
+        self,
+        roi: Optional[Tuple[int, int, int, int]] = None,
+        state: str = "-",
+        fill: Optional[float] = None,
+        blue: Optional[float] = None,
+        purple: Optional[float] = None,
+        raw: str = "",
+    ):
+        if not hasattr(self, "gauge_roi_info_lbl"):
+            return
+        if roi:
+            x, y, w, h = map(int, roi)
+            self.gauge_roi_info_lbl.setText(f"ROI: x={x}, y={y}, w={w}, h={h}")
+        else:
+            self.gauge_roi_info_lbl.setText("ROI: 未検出")
+        if fill is None:
+            self.gauge_value_info_lbl.setText("値: -")
+            self.gauge_ratio_info_lbl.setText("fill: - / blue: - / purple: -")
+        else:
+            self.gauge_value_info_lbl.setText(f"値: {fill * 100:.1f}%")
+            self.gauge_ratio_info_lbl.setText(f"fill: {fill:.2f} / blue: {float(blue or 0):.2f} / purple: {float(purple or 0):.2f}")
+        detail = f"状態: {state}"
+        if raw:
+            detail += f" / {raw}"
+        self.gauge_state_info_lbl.setText(detail)
 
     def set_roi_target(self, name: str):
         # 切替時に毎回スクショ/テンプレート照合を走らせると数秒固まるため、
@@ -2341,15 +3111,19 @@ class MainWindow(QMainWindow):
         if not crop:
             self.orig_preview.setText("範囲なし")
             self.proc_preview.setText("-")
+            if self.current_roi_target == "gauge":
+                self.update_gauge_detection_info()
             return
         if self.current_roi_target == "money":
-            proc = preprocess_simple(crop, self.money_scale_spin.value(), self.money_threshold_spin.value(), self.money_invert_check.isChecked())
+            proc = preprocess_simple(crop, invert=self.money_invert_check.isChecked())
         elif self.current_roi_target == "gauge":
             proc = gauge_mask_preview(crop)
             state, fill, blue, purple, raw = detect_gauge_state(crop, self.build_runtime_cfg())
             self.raw_lbl.setText(f"ゲージ: {raw}")
+            roi = self.cfg.get("gauge_roi")
+            self.update_gauge_detection_info(tuple(roi) if roi else None, state, fill, blue, purple, raw)
         else:
-            proc = preprocess_simple(crop, self.stage_scale_spin.value(), self.stage_threshold_spin.value(), self.stage_invert_check.isChecked())
+            proc = preprocess_simple(crop, invert=self.stage_invert_check.isChecked())
         self.orig_preview.setPixmap(pil_to_pixmap(crop))
         self.proc_preview.setPixmap(pil_to_pixmap(proc))
 
@@ -2376,15 +3150,19 @@ class MainWindow(QMainWindow):
                 res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
                 msgs.append(f"G={res.money if res.money is not None else '-'} raw:{res.raw_text}")
                 if res.money is not None:
-                    self.current_money_lbl.setText(f"{res.money:,}")
+                    self.current_money_lbl.setText(f"{res.money:,} G")
+                    if hasattr(self, "money_gauge"):
+                        self.money_gauge.set_value(float(res.money), max(float(res.money) * 1.25, 1.0))
             else:
                 msgs.append("所持金: 範囲なし")
             if runtime_cfg.get("gauge_roi"):
                 crop = crop_roi(img, tuple(runtime_cfg["gauge_roi"]))
                 state, fill, blue, purple, raw = detect_gauge_state(crop, runtime_cfg)
                 msgs.append(f"ゲージ {raw}")
+                self.update_gauge_detection_info(tuple(runtime_cfg["gauge_roi"]), state, fill, blue, purple, raw)
             else:
                 msgs.append("ゲージ: 範囲なし")
+                self.update_gauge_detection_info()
             if runtime_cfg.get("stage_num_roi") or runtime_cfg.get("stage_time_roi"):
                 res2 = ocr_stage_split_from_image(img, runtime_cfg)
                 msgs.append(f"ステージ={res2.stage or '-'} 秒={res2.duration_sec or '-'} / {res2.raw_text}")
@@ -2402,21 +3180,31 @@ class MainWindow(QMainWindow):
         if not self.running or not self.session_id or self.gauge_busy:
             return
         self.gauge_busy = True
-        worker = GaugeWorker(int(self.monitor_combo.currentData()), self.build_runtime_cfg())
+        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
+        if cfg.get("gauge_roi"):
+            cfg["_direct_gauge_capture"] = True
+            cfg["_runtime_rois_ready"] = True
+        worker = GaugeWorker(int(self.monitor_combo.currentData()), cfg)
         worker.signals.finished.connect(self.on_gauge_finished)
         self.pool.start(worker)
 
     def request_ocr_purpose(self, purpose: str) -> bool:
-        if not self.running or not self.session_id or self.ocr_busy:
+        if not self.running or not self.session_id:
+            return False
+        if self.ocr_busy:
+            if purpose == "stage_finish":
+                self.pending_ocr_purpose = "stage_finish"
             return False
         self.ocr_busy = True
-        worker = OcrWorker(int(self.monitor_combo.currentData()), self.build_runtime_cfg(), self.last_money, purpose)
+        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
+        worker = OcrWorker(int(self.monitor_combo.currentData()), cfg, self.last_money, purpose)
         worker.signals.finished.connect(self.on_worker_finished)
         self.pool.start(worker)
         return True
 
     def _refresh_stage_views(self):
         self.refresh_stage_summary_table()
+        self.refresh_session_log_table()
         self.refresh_efficiency_table()
         self.update_recommendation()
 
@@ -2461,6 +3249,7 @@ class MainWindow(QMainWindow):
         self.current_stage_start_ts = None
         self.gold_decreased_during_stage = False
         self.last_finish_transition_ts = 0.0
+        self.pending_ocr_purpose = None
         self._set_stage_wait_start()
 
     def _persist_session_start(self, result: MoneyOCRResult):
@@ -2491,9 +3280,11 @@ class MainWindow(QMainWindow):
         if result.money is None:
             return accepted, note
         if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
-            # Large sudden drop is normally an OCR miss. Do not let it create negative stage GPS/GPH.
-            result.money = None
-            return 0, "ocr_drop_ignored"
+            # Large drops can be OCR misses or real spending. Keep the live UI/sample moving,
+            # but exclude the active stage from scoring so the monitor never appears frozen.
+            note = "large_gold_drop_candidate"
+            if self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
+                self.gold_decreased_during_stage = True
 
         if self.last_money is not None and result.money < self.last_money:
             # Real spending or a small OCR wobble. Accept current gold for display, but mark the
@@ -2516,11 +3307,11 @@ class MainWindow(QMainWindow):
     def _persist_worker_sample(self, result: WorkerResult, accepted: int, note: str):
         if not self.session_id:
             return
-        with db_connect() as con:
-            con.execute(
-                "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
-                (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note),
-            )
+            with db_connect() as con:
+                con.execute(
+                    "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
+                    (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note),
+                )
 
     def _handle_worker_purpose(self, result: WorkerResult):
         if result.purpose == "stage_start":
@@ -2533,6 +3324,8 @@ class MainWindow(QMainWindow):
             self.commit_stage_from_finish_ocr(result)
 
     def _show_worker_debug(self, result: WorkerResult):
+        if result.purpose == "tick" and hasattr(self, "tabs") and self.tabs.currentIndex() not in (2, 3):
+            return
         debug_text = f"[{result.purpose}] 所持金: {result.money} / {result.money_raw}\nステージ/秒数: {result.stage} / {result.duration_sec}秒 / {result.stage_raw}"
         self.raw_lbl.setText(debug_text)
         if hasattr(self, "debug_last_lbl"):
@@ -2570,12 +3363,12 @@ class MainWindow(QMainWindow):
         from completion, poll slowly; near the end and during blue state, poll faster.
         """
         if result.state in ("blue", "blue_reached"):
-            return 1.5
-        if result.fill_ratio >= 0.71:
-            return 3.5
+            return 0.8
+        if result.fill_ratio >= 0.65:
+            return 1.2
         if result.state == "unknown":
-            return 3.5
-        return 10.0
+            return 2.5
+        return 2.0
 
     def apply_next_gauge_interval(self, result: GaugeResult):
         if not hasattr(self, "gauge_timer") or not self.running:
@@ -2584,6 +3377,7 @@ class MainWindow(QMainWindow):
         self.gauge_timer.setInterval(int(sec * 1000))
         if self.current_roi_target == "gauge":
             self.raw_lbl.setText(f"ゲージ {result.raw} / 次{sec:g}s")
+            self.update_gauge_detection_info(self.cfg.get("gauge_roi"), result.state, result.fill_ratio, result.blue_ratio, result.purple_ratio, f"{result.raw} / 次{sec:g}s")
 
     @Slot(object)
     # Gauge callbacks drive stage segmentation; UI tweaks should avoid changing this logic.
@@ -2740,6 +3534,11 @@ class MainWindow(QMainWindow):
         if stage and dur:
             loops_per_hour = 3600 / dur
             self.stage_loop_lbl.setText(f"{stage}  {loops_per_hour:,.1f}回")
+            if hasattr(self, "loop_gauge"):
+                self.loop_gauge.set_value(loops_per_hour, max(12.0, loops_per_hour * 1.25))
+            if hasattr(self, "current_stage_name_lbl"):
+                self.current_stage_name_lbl.setText(str(stage))
+                self.current_stage_state_lbl.setText("周回中")
         # Do not immediately treat the same purple/reset frame as a new clear.
         # The next run starts from this end gold, but a new log requires a fresh blue_reached transition.
         self._set_stage_running(end_money, result.ts)
@@ -2759,15 +3558,17 @@ class MainWindow(QMainWindow):
             img = capture_monitor(idx)
             runtime_cfg = apply_anchor_rois(img, self.build_runtime_cfg())
             if not runtime_cfg.get("money_roi"):
-                QMessageBox.warning(self, "自動範囲未検出", "所持金範囲を自動計算できませんでした。範囲・OCRタブで『自動設定』を実行してください。")
-                self.tabs.setCurrentIndex(1)
+                QMessageBox.warning(self, "自動範囲未検出", "所持金範囲を自動計算できませんでした。設定で『自動設定』を実行してください。")
+                self.open_settings_dialog()
                 return
+            runtime_cfg["_runtime_rois_ready"] = True
+            self.runtime_cfg_cache = dict(runtime_cfg)
             res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
         except Exception as e:
             QMessageBox.critical(self, "OCRエラー", str(e))
             return
         if res.money is None:
-            QMessageBox.warning(self, "OCR失敗", "開始時の所持金が読めません。範囲・OCR設定を調整してください。")
+            QMessageBox.warning(self, "OCR失敗", "開始時の所持金が読めません。設定を調整してください。")
             return
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_start_ts = time.time()
@@ -2776,18 +3577,19 @@ class MainWindow(QMainWindow):
         self.running = True
         # jp21: steam通信パルスは廃止。右下進捗ゲージの青到達→紫戻りでステージ区切りを判定。
         self.status_pill.setText("計測中")
+        if hasattr(self, "current_stage_state_lbl"):
+            self.current_stage_state_lbl.setText("監視中")
         self.status.showMessage(f"開始 G={res.money:,}")
         self._refresh_stage_views()
         self.update_stats(res.money)
-        self.ocr_timer.start(int(max(1.0, float(self.cfg.get("poll_interval", 5.0) or 5.0)) * 1000))
-        self.gauge_timer.start(1200)
-        self.request_ocr_tick()
+        self.gauge_timer.start(900)
         self.request_gauge_tick()
 
     # Session shutdown also finalizes aggregates in the DB; keep UI-only edits out of here.
     def stop_session(self):
         self.running = False
-        self.ocr_timer.stop()
+        if hasattr(self, "ocr_timer"):
+            self.ocr_timer.stop()
         self.gauge_timer.stop()
         self.stop_packet_pulse_sniffer()  # legacy no-op unless an old sniffer was active
         if self.session_id and self.session_start_ts and self.start_money is not None and self.last_money is not None:
@@ -2796,13 +3598,19 @@ class MainWindow(QMainWindow):
             avg_mps = gain / elapsed
             self._persist_session_stop(elapsed, gain, avg_mps)
         self.status_pill.setText("停止")
+        if hasattr(self, "current_stage_state_lbl"):
+            self.current_stage_state_lbl.setText("停止中")
         self.status.showMessage("停止しました")
 
     def request_ocr_tick(self):
         if not self.running or not self.session_id or self.ocr_busy:
             return
+        if self.stage_state in ("FINISH_PENDING", "FINISHING"):
+            self.request_ocr_purpose("stage_finish")
+            return
         self.ocr_busy = True
-        worker = OcrWorker(int(self.monitor_combo.currentData()), self.build_runtime_cfg(), self.last_money, "tick")
+        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
+        worker = OcrWorker(int(self.monitor_combo.currentData()), cfg, self.last_money, "tick")
         worker.signals.finished.connect(self.on_worker_finished)
         self.pool.start(worker)
 
@@ -2838,10 +3646,14 @@ class MainWindow(QMainWindow):
         # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
         # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
         self._show_worker_debug(result)
-        if self.running and self.stage_state == "FINISH_PENDING" and self.pending_stage_finish_ts:
+        pending = self.pending_ocr_purpose
+        self.pending_ocr_purpose = None
+        if self.running and pending == "stage_finish":
+            QTimer.singleShot(0, lambda: self.request_ocr_purpose("stage_finish"))
+        elif self.running and self.stage_state == "FINISH_PENDING" and self.pending_stage_finish_ts:
             # 次イベントループで終了OCRを再試行。これが2周目以降が出ない主因だった
             # 「終了検知時に通常OCR中でFINISHINGに固まる」状態を防ぐ。
-            QTimer.singleShot(80, lambda: self.finish_stage_run(float(self.pending_stage_finish_ts or time.time())))
+            QTimer.singleShot(40, lambda: self.finish_stage_run(float(self.pending_stage_finish_ts or time.time())))
 
     def set_stage_table_headers(self, headers: List[str]):
         translated = [self._tr(h) if hasattr(self, "_tr") else h for h in headers]
@@ -2859,54 +3671,33 @@ class MainWindow(QMainWindow):
 
 
 
-    def _build_efficiency_tab(self):
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
-        lay.setContentsMargins(5, 5, 5, 5)
-        lay.setSpacing(5)
-        top = QHBoxLayout()
-        title = QLabel("ステージ別ハイスコア（1-1〜3-10）")
-        title.setObjectName("section")
-        top.addWidget(title)
-        top.addStretch(1)
-        reset_one = QPushButton("選択ステージリセット")
-        reset_one.setObjectName("ghost")
-        reset_one.clicked.connect(self.reset_selected_efficiency_stage)
-        top.addWidget(reset_one)
-        reset = QPushButton("全リセット")
-        reset.setObjectName("ghost")
-        reset.clicked.connect(self.reset_all_efficiency_scores)
-        top.addWidget(reset)
-        lay.addLayout(top)
-        note = QLabel("各ステージの最高効率を保存します。3件以上あるステージは外れ値を除外してハイスコアを判定します。")
-        note.setObjectName("hint")
-        note.setWordWrap(True)
-        lay.addWidget(note)
-        self.eff_table = QTableWidget(30, 6)
-        self.eff_table.setHorizontalHeaderLabels([self._tr(x) for x in ["ステージ", "最高GPS", "最高GPH", "秒", "増加G", "採用/全件"]])
-        self.eff_table.verticalHeader().setVisible(False)
-        self.eff_table.setAlternatingRowColors(True)
-        self.eff_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.eff_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.eff_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.eff_table.setSortingEnabled(True)
-        self.eff_table.setObjectName("table")
-        lay.addWidget(self.eff_table, 1)
-        self.tabs.addTab(tab, "効率表")
-        self.refresh_efficiency_table()
-
     def refresh_stage_window_buttons(self):
         # jp24: 1分/3分/5分や集計/フル切替は廃止。
         return
+
+    def toggle_recommend_panel(self):
+        if not hasattr(self, "recommend_body"):
+            return
+        expanded = not self.recommend_body.isVisible()
+        self.recommend_body.setVisible(expanded)
+        if hasattr(self, "recommend_toggle_btn"):
+            text = self.recommend_toggle_btn.text()
+            marker = "▲" if expanded else "▼"
+            self.recommend_toggle_btn.setText(re.sub(r"^[▲▼]\s*", marker + " ", text))
+        if expanded and self.height() < 640:
+            self.resize(max(self.width(), 700), 640)
+        elif not expanded and self.height() > 340:
+            self.resize(max(self.width(), 700), 300)
 
     def refresh_stage_summary_table(self):
         """Show only completed-stage rows. No time bucket aggregation."""
         if not hasattr(self, "stage_table"):
             return
-        self.set_stage_table_headers(["ステージ", "秒", "増加G", "GPS", "GPH", "周回/h"])
+        self.set_stage_table_headers(["時刻", "ステージ", "秒", "GPS", "GPH", "増加G"])
         self.stage_table.setSortingEnabled(False)
         self.stage_table.setRowCount(0)
         if not self.session_id:
+            self.update_session_summary_labels()
             self.stage_table.setSortingEnabled(True)
             return
         try:
@@ -2917,24 +3708,35 @@ class MainWindow(QMainWindow):
                     FROM stage_runs
                     WHERE session_id=?
                     ORDER BY ts DESC
-                    LIMIT 200
+                    LIMIT 5
                     """,
                     (self.session_id,),
                 ).fetchall()
+            max_gps = max([float(r[3] or 0) for r in rows] + [1.0])
+            max_gph = max([float(r[4] or 0) for r in rows] + [1.0])
             for stage, dur, delta, gps, gph, ts in rows:
                 row = self.stage_table.rowCount()
                 self.stage_table.insertRow(row)
                 loops = (3600 / float(dur)) if dur else 0.0
+                try:
+                    time_text = datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+                except Exception:
+                    time_text = "-"
                 vals = [
+                    (time_text, float(ts or 0)),
                     (stage or "-", self._stage_sort_key(stage or "")),
                     ("-" if not dur else f"{int(dur)}", int(dur or 0)),
-                    (f"{int(delta or 0):,}", int(delta or 0)),
                     ("-" if not gps else f"{float(gps):,.2f}", float(gps or 0)),
                     ("-" if not gph else f"{float(gph):,.0f}", float(gph or 0)),
-                    ("-" if not loops else f"{loops:,.1f}", float(loops or 0)),
+                    (f"+{int(delta or 0):,} G", int(delta or 0)),
                 ]
                 for c, (text, key) in enumerate(vals):
                     self.stage_table.setItem(row, c, SortableItem(text, key))
+                if gps:
+                    self.stage_table.setCellWidget(row, 3, PixelProgressBar(float(gps), max_gps, THEME["green"], f"{float(gps):,.0f}"))
+                if gph:
+                    self.stage_table.setCellWidget(row, 4, PixelProgressBar(float(gph), max_gph, THEME["bar_gold"], f"{float(gph):,.0f}"))
+            self.update_session_summary_labels()
         except Exception as e:
             self.status.showMessage(f"ステージ履歴表示エラー: {e}")
         self.stage_table.setSortingEnabled(True)
@@ -3019,53 +3821,91 @@ class MainWindow(QMainWindow):
             out[stage] = (best[1], best[0], len(rows), total_count, best[2], best[3])
         return out
 
+    def _eff_metric_value(self, row: Tuple[float, float, int, int, int, int], metric: Optional[str] = None) -> float:
+        gps, gph, adopted, total, dur, delta = row
+        metric = metric or getattr(self, "eff_metric", "gps")
+        if metric == "gph":
+            return float(gph)
+        if metric == "delta":
+            return float(delta)
+        if metric == "loops":
+            return (3600.0 / float(dur)) if dur else 0.0
+        return float(gps)
+
+    def set_efficiency_metric(self, metric: str):
+        self.eff_metric = metric
+        for key, btn in getattr(self, "eff_metric_buttons", {}).items():
+            btn.setObjectName("modeActive" if key == metric else "modeInactive")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            btn.update()
+        self.refresh_efficiency_table()
+
+    def select_efficiency_stage(self, stage: str):
+        self.selected_eff_stage = stage
+        self.refresh_efficiency_table()
+
+    def update_efficiency_detail(self, data: Dict[str, Tuple[float, float, int, int, int, int]]):
+        if not hasattr(self, "eff_detail_lbl"):
+            return
+        stage = getattr(self, "selected_eff_stage", None)
+        if not stage:
+            self.eff_detail_lbl.setText("ステージセルを選択してください。")
+            return
+        row = data.get(stage)
+        if not row:
+            self.eff_detail_lbl.setText(f"{stage}: 未計測")
+            return
+        gps, gph, adopted, total, dur, delta = row
+        loops = (3600.0 / dur) if dur else 0.0
+        self.eff_detail_lbl.setText(
+            f"{stage} | GPS {gps:,.2f} | GPH {gph:,.0f} | {dur}s | +{delta:,}G | {loops:,.1f}周/h | {adopted}/{total}"
+        )
+
     def refresh_efficiency_table(self):
-        if not hasattr(self, "eff_table"):
+        if not hasattr(self, "eff_cells"):
             return
         data = self._stage_efficiency_rows()
-        stages = self.fixed_stage_list()
-        self.eff_table.setSortingEnabled(False)
-        self.eff_table.setRowCount(len(stages))
-        for row, stage in enumerate(stages):
-            item_stage = SortableItem(stage, self._stage_sort_key(stage))
-            self.eff_table.setItem(row, 0, item_stage)
-            if stage in data:
-                gps, gph, adopted, total, dur, delta = data[stage]
-                vals = [
-                    (f"{gps:,.2f}", float(gps)),
-                    (f"{gph:,.0f}", float(gph)),
-                    (f"{dur}", int(dur)),
-                    (f"{delta:,}", int(delta)),
-                    (f"{adopted}/{total}", int(total)),
-                ]
-            else:
-                vals = [("-", 0), ("-", 0), ("-", 0), ("-", 0), ("-", 0)]
-            for c, (text, key) in enumerate(vals, start=1):
-                self.eff_table.setItem(row, c, SortableItem(text, key))
-        self.eff_table.setSortingEnabled(True)
+        top_stage = None
+        if data:
+            top_stage = max(data.items(), key=lambda kv: self._eff_metric_value(kv[1]))[0]
+        recommended = None
+        if data:
+            recommended = max(data.items(), key=lambda kv: kv[1][1])[0]
+        for stage, cell in self.eff_cells.items():
+            cell.set_stage_data(data.get(stage), getattr(self, "eff_metric", "gps"), stage == top_stage, stage == recommended)
+            cell.set_selected_visual(stage == getattr(self, "selected_eff_stage", None))
+        self.update_efficiency_detail(data)
 
     def update_recommendation(self):
         if not hasattr(self, "recommend_lbl"):
             return
         data = self._stage_efficiency_rows()
         if not data:
-            self.recommend_lbl.setText("-")
+            text = "★オススメ -"
+            self.recommend_lbl.setText(text)
+            if hasattr(self, "recommend_toggle_btn"):
+                marker = "▲" if getattr(self, "recommend_body", None) and self.recommend_body.isVisible() else "▼"
+                self.recommend_toggle_btn.setText(f"{marker} {text}")
             return
         stage, (gps, gph, adopted, total, dur, delta) = max(data.items(), key=lambda kv: kv[1][1])
         runh = (3600.0 / dur) if dur else 0.0
-        self.recommend_lbl.setText(f"{stage} / GPS {gps:,.2f} / GPH {gph:,.0f} / {runh:,.1f}周/h")
+        text = f"★オススメ {stage} / GPS {gps:,.2f} / GPH {gph:,.0f} / {runh:,.1f}周"
+        self.recommend_lbl.setText(text)
+        if hasattr(self, "recommend_toggle_btn"):
+            marker = "▲" if getattr(self, "recommend_body", None) and self.recommend_body.isVisible() else "▼"
+            self.recommend_toggle_btn.setText(f"{marker} {text}")
 
     def reset_selected_efficiency_stage(self):
-        if not hasattr(self, "eff_table"):
-            return
-        row = self.eff_table.currentRow()
-        if row < 0:
+        stage = getattr(self, "selected_eff_stage", None)
+        if not stage and hasattr(self, "eff_table"):
+            row = self.eff_table.currentRow()
+            if row >= 0:
+                item = self.eff_table.item(row, 0)
+                stage = item.text().strip() if item else None
+        if not stage:
             QMessageBox.information(self, "ステージ未選択", "効率表でリセットしたいステージ行を選択してください。")
             return
-        item = self.eff_table.item(row, 0)
-        if not item:
-            return
-        stage = item.text().strip()
         if not re.match(r"^\d+-\d+$", stage):
             return
         with db_connect() as con:
@@ -3095,9 +3935,8 @@ class MainWindow(QMainWindow):
         """ステージクリア通知が消えたら、同じステージ/秒数でも次回は新規クリアとして受け付ける。"""
         if not getattr(self, "stage_notice_key", None):
             return
-        poll = max(1.0, float(self.cfg.get("poll_interval", 5.0) or 5.0))
         # OCRが1～2回失敗しただけで解除しないよう、最低8秒は保持する。
-        if ts - float(getattr(self, "stage_notice_last_seen", 0.0)) > max(8.0, poll * 3.0):
+        if ts - float(getattr(self, "stage_notice_last_seen", 0.0)) > 15.0:
             self.stage_notice_key = None
             self.stage_notice_logged = False
 
@@ -3167,6 +4006,7 @@ class MainWindow(QMainWindow):
                 (self.session_id, ts, now_iso(), res.stage, dur, self.last_money, delta, gps, gph, res.raw_text),
             )
         self.refresh_stage_summary_table()
+        self.refresh_session_log_table()
         self.refresh_efficiency_table()
         self.update_recommendation()
 
@@ -3201,10 +4041,19 @@ class MainWindow(QMainWindow):
 
     def update_clock_only(self):
         if self.running and self.session_id and self.session_start_ts:
-            self.elapsed_lbl.setText(format_elapsed(time.time() - self.session_start_ts))
+            stage_elapsed = 0.0
+            if self.current_stage_start_ts:
+                stage_elapsed = max(0.0, time.time() - self.current_stage_start_ts)
+            self.elapsed_lbl.setText("-" if not self.current_stage_start_ts else f"{int(stage_elapsed)}s")
+            if hasattr(self, "elapsed_gauge"):
+                self.elapsed_gauge.set_value(stage_elapsed, max(180.0, stage_elapsed * 1.25))
+            self.update_session_summary_labels()
 
     def update_stats(self, money: int):
-        self.current_money_lbl.setText(f"{money:,}")
+        self.current_money_lbl.setText(f"{money:,} G")
+        if hasattr(self, "money_gauge"):
+            base = max(float(self.start_money or money or 1), 1.0)
+            self.money_gauge.set_value(float(money or 0), max(base * 1.5, float(money or 1)))
         if not self.session_start_ts or self.start_money is None:
             return
         elapsed = max(0.001, time.time() - self.session_start_ts)
@@ -3212,12 +4061,21 @@ class MainWindow(QMainWindow):
         # 表示用の増加G/平均GPHは「現在所持金 - 開始所持金」ではなく、
         # サンプル間の正の増加だけを累積した値を使う。
         # これにより、買い物などでゴールドを消費しても平均GPHが壊れない。
-        self.gain_lbl.setText(f"{gain:,}")
-        self.elapsed_lbl.setText(format_elapsed(elapsed))
+        self.gain_lbl.setText(f"+{gain:,} G")
+        stage_elapsed = max(0.0, time.time() - self.current_stage_start_ts) if self.current_stage_start_ts else 0.0
+        self.elapsed_lbl.setText("-" if not self.current_stage_start_ts else f"{int(stage_elapsed)}s")
         avg_gps = gain / elapsed
-        self.avg_gph_lbl.setText(f"{avg_gps * 3600:,.0f}")
+        avg_gph = avg_gps * 3600
+        self.avg_gph_lbl.setText(f"{avg_gph:,.0f}")
         gps5 = self.window_mps(300)
         self.gps_5m_lbl.setText("-" if gps5 is None else f"{gps5:,.2f}")
+        if hasattr(self, "gain_gauge"):
+            self.gain_gauge.set_value(gain, max(gain * 1.25, 1))
+            self.avg_gph_gauge.set_value(avg_gph, max(avg_gph * 1.25, 1))
+            gps_val = float(gps5 or 0.0)
+            self.gps_gauge.set_value(gps_val, max(gps_val * 1.25, 1))
+            self.elapsed_gauge.set_value(stage_elapsed, max(180.0, stage_elapsed * 1.25))
+        self.update_session_summary_labels()
 
     def window_mps(self, seconds: int) -> Optional[float]:
         if len(self.samples) < 2:
@@ -3256,6 +4114,7 @@ class MainWindow(QMainWindow):
         self.stage_blue_seen = False
         self.stage_loop_lbl.setText("-")
         self.refresh_stage_summary_table()
+        self.refresh_session_log_table()
         self.refresh_efficiency_table()
         self.update_recommendation()
         self.status.showMessage("ステージ履歴をリセットしました")
@@ -3290,6 +4149,18 @@ class MainWindow(QMainWindow):
                 for row in con.execute("SELECT session_id, ts_iso, money, raw_text, accepted, note FROM samples WHERE session_id=? ORDER BY ts", (self.session_id,)):
                     wr.writerow(row)
         QMessageBox.information(self, "CSV出力", f"{out1}\n{out2}")
+
+    def open_export_folder(self):
+        try:
+            EXPORT_DIR.mkdir(exist_ok=True)
+            ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(EXPORT_DIR)))
+        except Exception as e:
+            self.status.showMessage(f"保存先フォルダエラー: {e}")
+            return
+        if ok:
+            self.status.showMessage(f"保存先フォルダを開きました: {EXPORT_DIR}")
+        else:
+            self.status.showMessage(f"保存先フォルダを開けませんでした: {EXPORT_DIR}")
 
 
 def main():

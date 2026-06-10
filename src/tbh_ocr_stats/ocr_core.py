@@ -13,6 +13,7 @@ from PIL import Image
 
 DURATION_MIN_SEC = 3
 DURATION_MAX_SEC = 900
+OCR_PREPROCESS_SCALE = 3.0
 
 
 @dataclass
@@ -46,16 +47,25 @@ def crop_roi(img: Image.Image, roi: Tuple[int, int, int, int]) -> Image.Image:
     return img.crop((x, y, x + w, y + h))
 
 
-def preprocess_simple(img: Image.Image, scale: float, threshold: int, invert: bool) -> Image.Image:
+def preprocess_simple(img: Image.Image, scale: float = OCR_PREPROCESS_SCALE, threshold: int = 0, invert: bool = False) -> Image.Image:
     arr = np.array(img.convert("RGB"))
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    if scale and abs(scale - 1.0) > 0.01:
-        gray = cv2.resize(gray, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_CUBIC)
-    if threshold > 0:
+    if abs(scale - 1.0) > 0.01:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if int(threshold or 0) > 0:
         _, gray = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY)
+    else:
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     if invert:
         gray = 255 - gray
     return Image.fromarray(gray)
+
+
+def preprocess_ocr_candidates(img: Image.Image, invert: bool, fixed_thresholds: List[int]) -> List[Tuple[str, Image.Image]]:
+    candidates: List[Tuple[str, Image.Image]] = [("otsu", preprocess_simple(img, invert=invert))]
+    for threshold in fixed_thresholds:
+        candidates.append((f"t{threshold}", preprocess_simple(img, threshold=threshold, invert=invert)))
+    return candidates
 
 
 def gauge_mask_preview(crop: Image.Image) -> Image.Image:
@@ -283,16 +293,16 @@ def parse_duration_text(text: str) -> Optional[int]:
 
 
 def _ocr_text_from_crop(crop: Image.Image, cfg: dict, whitelist: str, psm_list: List[int]) -> List[str]:
-    img = preprocess_simple(crop, cfg.get("stage_scale", 3.0), cfg.get("stage_threshold", 135), cfg.get("stage_invert", True))
     raws: List[str] = []
-    for psm in psm_list:
-        config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
-        try:
-            raw = pytesseract.image_to_string(img, config=config).strip()
-            if raw:
-                raws.append(raw)
-        except Exception as e:
-            raws.append(f"ERR:{e}")
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("stage_invert", True), [69, 100, 135, 150]):
+        for psm in psm_list:
+            config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
+            try:
+                raw = pytesseract.image_to_string(img, config=config).strip()
+                if raw:
+                    raws.append(raw)
+            except Exception as e:
+                raws.append(f"ERR:{e}")
     return raws
 
 
@@ -337,23 +347,18 @@ def ocr_stage_split_from_image(img: Image.Image, cfg: dict) -> StageOCRResult:
 
 
 def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int]) -> MoneyOCRResult:
-    img = preprocess_simple(crop, cfg.get("money_scale", 3.0), cfg.get("money_threshold", 150), cfg.get("money_invert", True))
     configs = [
         "--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789,.",
     ]
-    if not cfg.get("light_mode", True):
-        configs += [
-            "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789,.",
-            "--psm 13 --oem 3 -c tessedit_char_whitelist=0123456789,.",
-        ]
     results: List[Tuple[int, str]] = []
     raws: List[str] = []
-    for config in configs:
-        raw = pytesseract.image_to_string(img, config=config).strip()
-        money = parse_money(raw)
-        raws.append(f"{raw!r}->{money}")
-        if money is not None:
-            results.append((money, raw))
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("money_invert", True), [150, 135, 100, 69]):
+        for config in configs:
+            raw = pytesseract.image_to_string(img, config=config).strip()
+            money = parse_money(raw)
+            raws.append(f"{label}:{raw!r}->{money}")
+            if money is not None:
+                results.append((money, f"{label}:{raw}"))
     if not results:
         return MoneyOCRResult(None, " / ".join(raws))
     if last_money:
@@ -365,23 +370,18 @@ def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int])
 
 
 def ocr_stage_from_crop(crop: Image.Image, cfg: dict) -> StageOCRResult:
-    img = preprocess_simple(crop, cfg.get("stage_scale", 3.0), cfg.get("stage_threshold", 135), cfg.get("stage_invert", True))
     configs = [
         "--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789-繝ｼ窶千ｧ痴sec()・茨ｼ・.",
     ]
-    if not cfg.get("light_mode", True):
-        configs += [
-            "--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789-繝ｼ窶千ｧ痴sec()・茨ｼ・.",
-            "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789-繝ｼ窶千ｧ痴sec()・茨ｼ・.",
-        ]
     raws: List[str] = []
     candidates: List[Tuple[str, Optional[str], Optional[int]]] = []
-    for config in configs:
-        raw = pytesseract.image_to_string(img, config=config).strip()
-        stg, dur = parse_stage_result(raw)
-        raws.append(f"{raw!r}->{stg},{dur}")
-        if stg or dur:
-            candidates.append((raw, stg, dur))
+    for label, img in preprocess_ocr_candidates(crop, cfg.get("stage_invert", True), [69, 100, 135, 150]):
+        for config in configs:
+            raw = pytesseract.image_to_string(img, config=config).strip()
+            stg, dur = parse_stage_result(raw)
+            raws.append(f"{label}:{raw!r}->{stg},{dur}")
+            if stg or dur:
+                candidates.append((f"{label}:{raw}", stg, dur))
     if not candidates:
         return StageOCRResult(None, None, " / ".join(raws))
     candidates.sort(key=lambda x: (1 if x[1] else 0, 1 if x[2] else 0), reverse=True)
