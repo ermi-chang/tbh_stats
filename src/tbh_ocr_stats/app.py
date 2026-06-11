@@ -282,6 +282,13 @@ BOSS_SEARCH_LAYOUT = [375, 800, 180, 135]
 # Boss icon top-leftから見た実ゲージ部分。添付のx1.5画像基準。
 BOSS_TO_GAUGE_LAYOUT = [20, 14, 78, 16]
 
+# ルーン画面検出用。ルーン枠の所持金は上部HUDと「同じ金コイン＋同じ並び」なので、
+# 画面内に出現する2個目の金コインを探し、通常の金額オフセットで読む（手動ROI不要）。
+# RUNE_MONEY_OFFSET は AUTO_ROI_LAYOUT["money"] と同義。ズレた時に独立調整できるよう別定数化。
+RUNE_MONEY_OFFSET = [36, -1, 112, 31]
+# HUDコイン中心からこの距離(px, x1基準テンプレ幅換算)以内のマッチは自分自身とみなし除外。
+RUNE_COIN_MIN_SEP_FACTOR = 2.2  # 検出アンカー幅 × この係数
+
 
 
 def now_iso() -> str:
@@ -336,6 +343,7 @@ class WorkerResult:
     purpose: str = "tick"
     stage_candidates: List[str] = field(default_factory=list)
     duration_candidates: List[int] = field(default_factory=list)
+    money_source: str = "main"  # "main"=上部HUD / "rune"=ルーン画面内の所持金枠
 
 
 @dataclass
@@ -660,6 +668,58 @@ def _clamp_roi(img: Image.Image, roi: Tuple[int, int, int, int]) -> List[int]:
     w = max(1, min(w, img.width - x))
     h = max(1, min(h, img.height - y))
     return [x, y, w, h]
+
+
+def locate_secondary_anchor(img: Image.Image, cfg: dict, primary_xy: Tuple[float, float], min_sep_px: float, scale: float) -> Optional[Tuple[int, int, int, int, float, float]]:
+    """Find a SECOND gold-coin icon (e.g. the one inside the rune screen) away from the HUD coin.
+
+    Reuses the anchor template at (around) the already-detected HUD scale. Returns the best peak
+    whose center is at least ``min_sep_px`` away from ``primary_xy`` (the HUD coin center), so we do
+    not re-detect the HUD coin itself. Returns (x, y, w, h, score, scale) or None.
+    """
+    template_img = _load_anchor_template(cfg)
+    if template_img is None:
+        return None
+    scr_gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    tpl_gray0 = cv2.cvtColor(np.array(template_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    th0, tw0 = tpl_gray0.shape[:2]
+    if tw0 < 6 or th0 < 6:
+        return None
+    min_score = float(cfg.get("rune_coin_min_score", cfg.get("anchor_min_score", 0.62)))
+    base = float(scale or 1.0)
+    best = None
+    for sc in sorted(set(round(base * f, 4) for f in (0.9, 1.0, 1.1) if base * f > 0)):
+        tw = max(4, int(round(tw0 * sc)))
+        th = max(4, int(round(th0 * sc)))
+        if tw >= scr_gray.shape[1] or th >= scr_gray.shape[0]:
+            continue
+        tpl_gray = cv2.resize(tpl_gray0, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
+        try:
+            res = cv2.matchTemplate(scr_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        except Exception:
+            continue
+        ys, xs = np.where(res >= min_score)
+        for yy, xx in zip(ys.tolist(), xs.tolist()):
+            cxc = xx + tw / 2.0
+            cyc = yy + th / 2.0
+            if (cxc - primary_xy[0]) ** 2 + (cyc - primary_xy[1]) ** 2 < min_sep_px ** 2:
+                continue  # too close to the HUD coin → this is the coin we already track
+            score = float(res[yy, xx])
+            if best is None or score > best[4]:
+                best = (int(xx), int(yy), tw, th, score, float(sc))
+    return best
+
+
+def rune_money_rect_from_coin(img: Image.Image, coin: Tuple[int, int, int, int, float, float]) -> List[int]:
+    """Money rectangle relative to a found coin, using the same offset as the normal HUD money ROI."""
+    cx, cy, _cw, _ch, _score, cscale = coin
+    dx, dy, w, h = map(float, RUNE_MONEY_OFFSET)
+    return _clamp_roi(img, (
+        int(round(cx + dx * cscale)),
+        int(round(cy + dy * cscale)),
+        int(round(w * cscale)),
+        int(round(h * cscale)),
+    ))
 
 
 def compute_auto_rois_from_anchor(img: Image.Image, det: Tuple[int, int, int, int, float, float], cfg: dict) -> dict:
@@ -1587,8 +1647,16 @@ class OcrWorker(QRunnable):
             runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
             money_res = MoneyOCRResult(None, "所持金範囲なし")
             stage_res = StageOCRResult(None, None, "通知範囲なし")
+            money_source = "main"
             if runtime_cfg.get("money_roi"):
                 money_res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
+            # ルーン画面表示中は上部HUDが誤読しやすい。ルーン画面内には通常と同じ金コインが2個目として
+            # 現れるので、それを探索し、見つかればそのコインから通常と同じオフセットで金額を読む。
+            # 妥当な金額が返れば「ルーン画面オープン中の正値」とみなし上部HUDの読みを置き換える。
+            rune_res = self._read_rune_money(img, runtime_cfg)
+            if rune_res is not None and rune_res.money is not None:
+                money_res = rune_res
+                money_source = "rune"
             if runtime_cfg.get("stage_num_roi") or runtime_cfg.get("stage_time_roi"):
                 stage_res = ocr_stage_split_from_image(img, runtime_cfg)
             elif runtime_cfg.get("stage_roi"):
@@ -1596,10 +1664,35 @@ class OcrWorker(QRunnable):
             self.signals.finished.emit(WorkerResult(
                 ts, money_res.money, money_res.raw_text, stage_res.stage, stage_res.duration_sec, stage_res.raw_text, None, self.purpose,
                 stage_candidates=stage_res.stage_candidates, duration_candidates=stage_res.duration_candidates,
+                money_source=money_source,
             ))
         except Exception as e:
             self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", str(e), self.purpose))
 
+    def _read_rune_money(self, img: Image.Image, runtime_cfg: dict) -> Optional[MoneyOCRResult]:
+        """Detect the rune-screen money by finding a 2nd gold coin and reading it like the HUD money.
+
+        Returns a MoneyOCRResult only when a secondary coin is found AND a sane money value is read;
+        otherwise None (so the caller keeps the normal HUD reading). Never raises.
+        """
+        anchor = runtime_cfg.get("anchor_roi")
+        if not anchor:
+            return None
+        try:
+            ax, ay, aw, ah = map(float, anchor[:4])
+            scale = float(runtime_cfg.get("detected_template_scale", 1.0) or 1.0)
+            primary = (ax + aw / 2.0, ay + ah / 2.0)
+            min_sep = aw * RUNE_COIN_MIN_SEP_FACTOR
+            coin = locate_secondary_anchor(img, runtime_cfg, primary, min_sep, scale)
+            if not coin:
+                return None
+            rect = rune_money_rect_from_coin(img, coin)
+            res = ocr_money_from_crop(crop_roi(img, tuple(rect)), runtime_cfg, self.last_money)
+            if res.money is None:
+                return None
+            return MoneyOCRResult(res.money, f"[rune coin@{coin[0]},{coin[1]} s={coin[4]:.2f}] {res.raw_text}")
+        except Exception:
+            return None
 
 
 class GaugeWorker(QRunnable):
@@ -3136,6 +3229,16 @@ class MainWindow(QMainWindow):
                         self.money_gauge.set_value(float(res.money), max(float(res.money) * 1.25, 1.0))
             else:
                 msgs.append("所持金: 範囲なし")
+            anchor = runtime_cfg.get("anchor_roi")
+            if anchor:
+                ax, ay, aw, ah = map(float, anchor[:4])
+                sc = float(runtime_cfg.get("detected_template_scale", 1.0) or 1.0)
+                coin = locate_secondary_anchor(img, runtime_cfg, (ax + aw / 2.0, ay + ah / 2.0), aw * RUNE_COIN_MIN_SEP_FACTOR, sc)
+                if coin:
+                    rres = ocr_money_from_crop(crop_roi(img, tuple(rune_money_rect_from_coin(img, coin))), runtime_cfg, self.last_money)
+                    msgs.append(f"ルーンG={rres.money if rres.money is not None else '-'} (coin score={coin[4]:.2f})")
+                else:
+                    msgs.append("ルーン: コイン未検出(画面が閉じている等)")
             if runtime_cfg.get("gauge_roi"):
                 crop = crop_roi(img, tuple(runtime_cfg["gauge_roi"]))
                 state, fill, blue, purple, raw = detect_gauge_state(crop, runtime_cfg)
@@ -3282,6 +3385,16 @@ class MainWindow(QMainWindow):
         note = ""
         if result.money is None:
             return accepted, note
+        # ルーン画面表示中はルーン枠の値が正値なのでスパイク保留を通さず信用する。
+        # ただしルーン画面中はfarming中ではないため、表示と基準(last_money)だけ更新し、
+        # 増加G(session_positive_gain)や直近5分のsamplesには加えない(統計を歪めない)。
+        if getattr(result, "money_source", "main") == "rune":
+            self._pending_money = None
+            if self.last_money is not None and result.money < self.last_money and self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
+                self.gold_decreased_during_stage = True
+            self.last_money = result.money
+            self.update_stats(result.money)
+            return 1, "rune_money"
         # 単発のOCR誤読(余分な桁など)で所持金が跳ね上がると、増加G/GPH/直近5分が壊れる。
         # 大きな上振れは1フレームで信用せず、次の読み取りで同程度の値が再確認できたときだけ採用する。
         # 一過性のスパイクは保留して統計に入れない(last_money/サンプル/gainを更新しない)。
