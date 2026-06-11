@@ -1,12 +1,11 @@
 ﻿from __future__ import annotations
 
-import csv
 from collections import deque
 import re
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,8 +15,8 @@ import mss
 import numpy as np
 import pytesseract
 from PIL import Image
-from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -50,7 +49,6 @@ from PySide6.QtWidgets import (
 from .runtime_env import (
     DEFAULT_ANCHOR_TEMPLATE,
     DEFAULT_BOSS_TEMPLATE,
-    EXPORT_DIR,
     USER_ASSET_DIR,
     configure_tesseract,
     db_connect,
@@ -322,6 +320,8 @@ class StageOCRResult:
     stage: Optional[str]
     duration_sec: Optional[int]
     raw_text: str
+    stage_candidates: List[str] = field(default_factory=list)
+    duration_candidates: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -334,6 +334,8 @@ class WorkerResult:
     stage_raw: str
     error: Optional[str] = None
     purpose: str = "tick"
+    stage_candidates: List[str] = field(default_factory=list)
+    duration_candidates: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -904,53 +906,64 @@ def is_valid_stage(stage: Optional[str]) -> bool:
 
 
 def choose_stage_candidate(candidates: List[str], cfg: dict) -> Optional[str]:
-    """Pick the most plausible stage OCR result.
+    """Pick the most plausible stage OCR result by majority vote.
 
-    Stage OCR occasionally reads 2-1 as 2-7.  The app only supports 1-1..3-10,
-    and stage farming usually repeats the same stage or advances to the next one.
-    Prefer known expected stages, then apply very conservative 7->1 correction.
+    Stage OCR runs many binarization/PSM variants; a single variant can misread
+    one digit (e.g. 2-3 as 2-8), so duplicates in `candidates` are meaningful
+    votes. Expected stages (previous/next) win ties and near-ties, but a clear
+    multi-vote majority is trusted even against expectations so a genuine stage
+    change is never rewritten.
     """
-    uniq: List[str] = []
-    for st in candidates:
-        if st and is_valid_stage(st) and st not in uniq:
-            uniq.append(st)
-    if not uniq:
+    valid = [st for st in candidates if st and is_valid_stage(st)]
+    if not valid:
         return None
+    order: List[str] = []
+    for st in valid:
+        if st not in order:
+            order.append(st)
+    counts = {st: valid.count(st) for st in order}
+    max_count = max(counts.values())
 
     expected: List[str] = []
     for st in cfg.get("_expected_stage_candidates", []) or []:
         if is_valid_stage(st) and st not in expected:
             expected.append(st)
 
-    # Exact expected match wins.
-    for st in expected:
-        if st in uniq:
-            return st
+    # Expected stage wins when it has comparable support. Correlated misreads can
+    # produce 2+ identical wrong votes, so near-ties resolve to the expected stage,
+    # while an overwhelming majority (genuine stage change) still passes through.
+    exp_present = [e for e in expected if e in counts]
+    if exp_present:
+        best_exp = max(exp_present, key=lambda e: counts[e])
+        if counts[best_exp] * 2 >= max_count:
+            return best_exp
 
-    # Conservative OCR correction: x-7 is often x-1 in this font.
-    # Only do this if the corrected value matches a known expected stage.
-    for cand in uniq:
-        m = re.match(r"^(\d+)-(\d+)$", cand)
-        if not m:
-            continue
-        world, num = int(m.group(1)), int(m.group(2))
-        if num == 7:
-            corrected = f"{world}-1"
-            if corrected in expected:
-                return corrected
+    winner = next(st for st in order if counts[st] == max_count)
 
-    # If the only candidate is a large jump from the expected same world, keep the
-    # expected stage instead of logging an impossible-looking jump.
-    if len(uniq) == 1 and expected:
-        cand = uniq[0]
-        ci = stage_to_index(cand)
+    # Conservative OCR correction: x-7 is often x-1 in this font. The misread is
+    # systematic across variants, so apply regardless of vote count, but only when
+    # the corrected value matches a known expected stage.
+    m = re.match(r"^(\d+)-7$", winner)
+    if m:
+        corrected = f"{m.group(1)}-1"
+        if corrected in expected:
+            return corrected
+
+    # Multi-variant agreement beats expectations: the user really changed stages.
+    if max_count >= 2:
+        return winner
+
+    # A single lone observation that jumps >=3 stages within the expected world is
+    # more likely a misread than a real jump; keep the expected stage.
+    if len(order) == 1 and expected:
+        ci = stage_to_index(winner)
         for exp in expected:
             ei = stage_to_index(exp)
-            if ci is not None and ei is not None and cand.split('-')[0] == exp.split('-')[0]:
+            if ci is not None and ei is not None and winner.split('-')[0] == exp.split('-')[0]:
                 if abs(ci - ei) >= 3:
                     return exp
 
-    return uniq[0]
+    return winner
 
 def parse_stage_result(text: str) -> Tuple[Optional[str], Optional[int]]:
     t = normalize_ocr_text(text)
@@ -1046,6 +1059,46 @@ def parse_duration_text(text: str) -> Optional[int]:
     # usually the actual seconds before duplicated/trailing noise.
     return candidates[0]
 
+
+def _most_common_first_seen(values: List[int]) -> Optional[int]:
+    order: List[int] = []
+    for v in values:
+        if v not in order:
+            order.append(v)
+    if not order:
+        return None
+    counts = {v: values.count(v) for v in order}
+    max_count = max(counts.values())
+    return next(v for v in order if counts[v] == max_count)
+
+
+def choose_commit_duration(ocr_candidates: List[int], measured: Optional[int]) -> Optional[int]:
+    """Reconcile OCR clear-time readings with the wall-clock measured elapsed time.
+
+    The game-displayed clear time (OCR) is the authoritative value, but OCR can pick
+    up duplicated digits (89 -> 899). The measured elapsed only arbitrates: it can span
+    multiple runs or pauses when gauge transitions were missed, so it must never
+    override an OCR consensus; it picks among disagreeing candidates, confirms
+    trailing-digit noise, and is committed alone only when OCR read nothing.
+    """
+    cands = [int(v) for v in ocr_candidates if DURATION_MIN_SEC <= int(v) <= DURATION_MAX_SEC]
+    meas_ok = measured is not None and DURATION_MIN_SEC <= int(measured) <= DURATION_MAX_SEC
+    if not cands:
+        return int(measured) if meas_ok else None
+    if meas_ok:
+        tol = max(8, round(int(measured) * 0.25))
+        near = [v for v in cands if abs(v - int(measured)) <= tol]
+        if near:
+            return _most_common_first_seen(near)
+        # Trailing-digit salvage (89 read as 899) only for a single weak read; a
+        # repeated consensus is kept even against a small bounced measurement.
+        for v in cands:
+            w = v // 10
+            if cands.count(v) == 1 and w >= DURATION_MIN_SEC and abs(w - int(measured)) <= tol:
+                return w
+    return _most_common_first_seen(cands)
+
+
 def _ocr_text_from_crop(crop: Image.Image, cfg: dict, whitelist: str, psm_list: List[int]) -> List[str]:
     raws: List[str] = []
     for label, img in preprocess_ocr_candidates(crop, cfg.get("stage_invert", True), [69, 100, 135, 150]):
@@ -1069,30 +1122,30 @@ def ocr_stage_split_from_image(img: Image.Image, cfg: dict) -> StageOCRResult:
     raw_parts: List[str] = []
     stage: Optional[str] = None
     duration: Optional[int] = None
+    stage_candidates: List[str] = []
+    duration_candidates: List[int] = []
 
     if cfg.get("stage_num_roi"):
         crop = crop_roi(img, tuple(cfg["stage_num_roi"]))
         raws = _ocr_text_from_crop(crop, cfg, "0123456789-ー‐ ", [7, 8, 13])
-        cand = []
         for r in raws:
             st = parse_stage_number_text(r)
             raw_parts.append(f"ステージ={st or '-'} raw:{r}")
             if st:
-                cand.append(st)
-        if cand:
-            stage = choose_stage_candidate(cand, cfg)
+                stage_candidates.append(st)
+        if stage_candidates:
+            stage = choose_stage_candidate(stage_candidates, cfg)
 
     if cfg.get("stage_time_roi"):
         crop = crop_roi(img, tuple(cfg["stage_time_roi"]))
         raws = _ocr_text_from_crop(crop, cfg, "0123456789秒sec()（） .", [7, 8, 13])
-        cand = []
         for r in raws:
             dur = parse_duration_text(r)
             raw_parts.append(f"秒={dur if dur is not None else '-'} raw:{r}")
             if dur:
-                cand.append(dur)
-        if cand:
-            duration = cand[0]
+                duration_candidates.append(dur)
+        if duration_candidates:
+            duration = _most_common_first_seen(duration_candidates)
 
     # フォールバック: 旧来の通知ROIも一応読む
     if (stage is None or duration is None) and cfg.get("stage_roi"):
@@ -1100,10 +1153,14 @@ def ocr_stage_split_from_image(img: Image.Image, cfg: dict) -> StageOCRResult:
         raw_parts.append(f"全文{full.raw_text}")
         if stage is None:
             stage = full.stage
+            if full.stage:
+                stage_candidates.append(full.stage)
         if duration is None:
             duration = full.duration_sec
+            if full.duration_sec:
+                duration_candidates.append(full.duration_sec)
 
-    return StageOCRResult(stage, duration, " / ".join(raw_parts))
+    return StageOCRResult(stage, duration, " / ".join(raw_parts), stage_candidates, duration_candidates)
 
 def format_elapsed(seconds: float) -> str:
     s = int(max(0, seconds))
@@ -1129,10 +1186,15 @@ def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int])
     if not results:
         return MoneyOCRResult(None, " / ".join(raws))
     if last_money:
-        sane = [r for r in results if r[0] >= last_money * 0.5 and r[0] <= last_money * 20]
+        sane = [r for r in results if last_money * 0.5 <= r[0] <= last_money * 3]
         if sane:
             results = sane
-    results.sort(key=lambda r: (len(str(r[0])), -abs((r[0] - (last_money or r[0])))), reverse=True)
+        # 前回確定値に最も近い候補を選ぶ。桁が増えた誤読(過大)も桁落ち(過小)も弾ける。
+        # 桁数の長い順だと「余分な桁の誤読」を優先してしまうため、近さで判定する。
+        results.sort(key=lambda r: abs(r[0] - last_money))
+    else:
+        # 初回など基準が無いときは従来どおり桁数の長い/大きい値を採用。
+        results.sort(key=lambda r: (len(str(r[0])), r[0]), reverse=True)
     return MoneyOCRResult(results[0][0], f"{results[0][1]!r} => {results[0][0]}")
 
 
@@ -1531,7 +1593,10 @@ class OcrWorker(QRunnable):
                 stage_res = ocr_stage_split_from_image(img, runtime_cfg)
             elif runtime_cfg.get("stage_roi"):
                 stage_res = ocr_stage_from_crop(crop_roi(img, tuple(runtime_cfg["stage_roi"])), runtime_cfg)
-            self.signals.finished.emit(WorkerResult(ts, money_res.money, money_res.raw_text, stage_res.stage, stage_res.duration_sec, stage_res.raw_text, None, self.purpose))
+            self.signals.finished.emit(WorkerResult(
+                ts, money_res.money, money_res.raw_text, stage_res.stage, stage_res.duration_sec, stage_res.raw_text, None, self.purpose,
+                stage_candidates=stage_res.stage_candidates, duration_candidates=stage_res.duration_candidates,
+            ))
         except Exception as e:
             self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", str(e), self.purpose))
 
@@ -1801,6 +1866,9 @@ class MainWindow(QMainWindow):
         self.stage_notice_last_seen = 0.0
         self.stage_notice_logged = False
         self.ocr_busy = False
+        self.ocr_busy_since = 0.0
+        self.gauge_busy_since = 0.0
+        self.finish_ocr_error_count = 0
         self.pending_ocr_purpose: Optional[str] = None
         self.runtime_cfg_cache: Optional[dict] = None
         self.packet_sniffer: Optional[PacketPulseSniffer] = None  # legacy unused
@@ -1818,7 +1886,8 @@ class MainWindow(QMainWindow):
         self.pending_stage_finish_ts: Optional[float] = None
         self.running = False
         self.pool = QThreadPool.globalInstance()
-        self.pool.setMaxThreadCount(1)
+        # ゲージ監視と所持金OCRを同時に走らせ、重い/失敗OCR中もゲージ判定を止めない。
+        self.pool.setMaxThreadCount(2)
 
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock_only)
@@ -1886,10 +1955,11 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "settings_dialog") or self.settings_dialog is None:
             dlg = QDialog(self)
             dlg.setWindowTitle("設定")
-            dlg.resize(760, 500)
+            dlg.resize(520, 380)
             lay = QVBoxLayout(dlg)
             lay.setContentsMargins(6, 6, 6, 6)
             lay.addWidget(self.settings_tab)
+            lay.addStretch(1)
             self.settings_dialog = dlg
         self.settings_dialog.show()
         self.settings_dialog.raise_()
@@ -1906,8 +1976,7 @@ class MainWindow(QMainWindow):
         creator = QLabel(
             f'開発者: {APP_CREATOR_NAME}<br>'
             f'<a href="{APP_CREATOR_GITHUB}">GitHub</a><br>'
-            f'<a href="{APP_CREATOR_BMAC}">Buy Me A Coffee</a><br>'
-            f'保存先: {EXPORT_DIR}'
+            f'<a href="{APP_CREATOR_BMAC}">Buy Me A Coffee</a>'
         )
         creator.setObjectName("hint")
         creator.setOpenExternalLinks(True)
@@ -1994,27 +2063,6 @@ class MainWindow(QMainWindow):
 
         self._build_recommend_dropdown(lay)
 
-        row = QHBoxLayout()
-        title = QLabel("履歴（直近5件）")
-        title.setObjectName("section")
-        row.addWidget(title)
-        row.addStretch(1)
-        lay.addLayout(row)
-
-        self.stage_table = QTableWidget(0, 6)
-        self.stage_table.setHorizontalHeaderLabels([self._tr(x) for x in ["時刻", "ステージ", "秒", "GPS", "GPH", "増加G"]])
-        self.stage_table.verticalHeader().setVisible(False)
-        self.stage_table.setAlternatingRowColors(True)
-        self.stage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.stage_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.stage_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.stage_table.horizontalHeader().setFixedHeight(16)
-        self.stage_table.setSortingEnabled(True)
-        self.stage_table.setObjectName("table")
-        self.stage_table.setMinimumHeight(76)
-        self.stage_table.setMaximumHeight(82)
-        self.stage_table.verticalHeader().setDefaultSectionSize(12)
-        lay.addWidget(self.stage_table)
         lay.addStretch(1)
         self.tabs.addTab(tab, "計測")
         self.refresh_stage_summary_table()
@@ -2029,7 +2077,7 @@ class MainWindow(QMainWindow):
         panel_l.setContentsMargins(4, 3, 4, 4)
         panel_l.setSpacing(3)
 
-        self.recommend_toggle_btn = QPushButton("▼ ★オススメ -")
+        self.recommend_toggle_btn = QPushButton("▼ ステージ別効率")
         self.recommend_toggle_btn.setObjectName("recommendHeader")
         self.recommend_toggle_btn.clicked.connect(self.toggle_recommend_panel)
         panel_l.addWidget(self.recommend_toggle_btn)
@@ -2101,8 +2149,8 @@ class MainWindow(QMainWindow):
 
         top = QFrame()
         top.setObjectName("panel")
-        top.setMinimumHeight(78)
-        top.setMaximumHeight(84)
+        top.setMinimumHeight(54)
+        top.setMaximumHeight(60)
         tl = QGridLayout(top)
         tl.setContentsMargins(7, 5, 7, 5)
         tl.setHorizontalSpacing(5)
@@ -2116,30 +2164,13 @@ class MainWindow(QMainWindow):
                 self.monitor_combo.addItem(label, i)
         self.monitor_label = QLabel("対象画面")
         tl.addWidget(self.monitor_label, 0, 0)
-        tl.addWidget(self.monitor_combo, 0, 1, 1, 3)
+        tl.addWidget(self.monitor_combo, 0, 1, 1, 4)
         self.monitor_combo.currentIndexChanged.connect(self.update_dashboard_environment)
 
-        self.ui_lang_label = QLabel("UI言語")
-        self.ui_lang_combo = QComboBox()
-        self.ui_lang_combo.setMinimumWidth(90)
-        for code, label in UI_LANGUAGES.items():
-            self.ui_lang_combo.addItem(label, code)
-        ui_idx = self.ui_lang_combo.findData(self.cfg.get("ui_language", "ja"))
-        self.ui_lang_combo.setCurrentIndex(max(0, ui_idx))
-        self.ui_lang_combo.currentIndexChanged.connect(self.on_ui_language_changed)
-        tl.addWidget(self.ui_lang_label, 0, 4)
-        tl.addWidget(self.ui_lang_combo, 0, 5)
-
-        self.game_lang_label = QLabel("ゲーム言語")
-        self.game_lang_combo = QComboBox()
-        self.game_lang_combo.setMinimumWidth(90)
-        for code, label in GAME_LANGUAGES:
-            self.game_lang_combo.addItem(label, code)
-        g_idx = self.game_lang_combo.findData(self.cfg.get("game_ocr_language", "ja"))
-        self.game_lang_combo.setCurrentIndex(max(0, g_idx))
-        self.game_lang_combo.currentIndexChanged.connect(self.on_game_language_changed)
-        tl.addWidget(self.game_lang_label, 2, 4)
-        tl.addWidget(self.game_lang_combo, 2, 5)
+        self.auto_anchor_btn = QPushButton("自動設定")
+        self.auto_anchor_btn.setObjectName("saveBtn")
+        self.auto_anchor_btn.clicked.connect(lambda: self.auto_detect_anchor(False))
+        tl.addWidget(self.auto_anchor_btn, 0, 5)
 
         self.view_scale_value = 1.0
 
@@ -2159,28 +2190,15 @@ class MainWindow(QMainWindow):
             tl.addWidget(btn, 1, col)
         self.anchor_enabled_check = QCheckBox("自動追従")
         self.anchor_enabled_check.setChecked(bool(self.cfg.get("anchor_enabled", True)))
-        tl.addWidget(self.anchor_enabled_check, 2, 0)
-        self.auto_anchor_btn = QPushButton("自動設定")
-        self.auto_anchor_btn.setObjectName("saveBtn")
-        self.auto_anchor_btn.clicked.connect(lambda: self.auto_detect_anchor(False))
-        tl.addWidget(self.auto_anchor_btn, 1, 5)
-        self.open_selector_btn = QPushButton("手動範囲")
-        self.open_selector_btn.setObjectName("ghost")
-        self.open_selector_btn.setToolTip("通常は不要です。自動設定で取れない場合の保険です。")
-        self.open_selector_btn.clicked.connect(self.open_roi_selector)
-        self.open_selector_btn.setVisible(False)
-        tl.addWidget(self.open_selector_btn, 2, 4)
+        tl.addWidget(self.anchor_enabled_check, 1, 4)
         test = QPushButton("OCRテスト")
         test.setObjectName("testBtn")
         test.clicked.connect(self.test_ocr)
-        tl.addWidget(test, 2, 5)
+        tl.addWidget(test, 1, 5)
         outer.addWidget(top)
 
         state = QHBoxLayout()
         state.setSpacing(4)
-        self.roi_state_lbl = QLabel("対象: 所持金 / 自動ROI")
-        self.roi_state_lbl.setObjectName("section")
-        state.addWidget(self.roi_state_lbl, 1)
         self.anchor_saved_lbl = QLabel("基準: 自動")
         self.money_saved_lbl = QLabel("所持金: 自動")
         self.stage_num_saved_lbl = QLabel("ステージ: 自動")
@@ -2192,6 +2210,7 @@ class MainWindow(QMainWindow):
             lab.setWordWrap(True)
             lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             state.addWidget(lab)
+        state.addStretch(1)
         outer.addLayout(state)
 
         preview_box = QFrame()
@@ -2214,28 +2233,6 @@ class MainWindow(QMainWindow):
         pv.addWidget(self.proc_preview, 1, 1)
         outer.addWidget(preview_box)
 
-        self.gauge_info_panel = QFrame()
-        self.gauge_info_panel.setObjectName("panel")
-        self.gauge_info_panel.setMaximumHeight(58)
-        gauge_info_l = QGridLayout(self.gauge_info_panel)
-        gauge_info_l.setContentsMargins(7, 5, 7, 5)
-        gauge_info_l.setHorizontalSpacing(10)
-        gauge_info_l.setVerticalSpacing(4)
-        gauge_title = QLabel("ゲージ検出情報")
-        gauge_title.setObjectName("section")
-        self.gauge_roi_info_lbl = QLabel("ROI: -")
-        self.gauge_value_info_lbl = QLabel("値: -")
-        self.gauge_ratio_info_lbl = QLabel("fill: - / blue: - / purple: -")
-        self.gauge_state_info_lbl = QLabel("状態: -")
-        for lab in [self.gauge_roi_info_lbl, self.gauge_value_info_lbl, self.gauge_ratio_info_lbl, self.gauge_state_info_lbl]:
-            lab.setObjectName("statusLine")
-        gauge_info_l.addWidget(gauge_title, 0, 0, 1, 2)
-        gauge_info_l.addWidget(self.gauge_roi_info_lbl, 1, 0)
-        gauge_info_l.addWidget(self.gauge_value_info_lbl, 1, 1)
-        gauge_info_l.addWidget(self.gauge_ratio_info_lbl, 2, 0)
-        gauge_info_l.addWidget(self.gauge_state_info_lbl, 2, 1)
-        outer.addWidget(self.gauge_info_panel)
-
         settings = QFrame()
         settings.setObjectName("panel")
         settings.setMinimumHeight(86)
@@ -2253,28 +2250,39 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.tess_path, 0, 1, 1, 4)
         grid.addWidget(browse, 0, 5)
 
+        self.ui_lang_label = QLabel("UI言語")
+        self.ui_lang_combo = QComboBox()
+        self.ui_lang_combo.setMinimumWidth(90)
+        for code, label in UI_LANGUAGES.items():
+            self.ui_lang_combo.addItem(label, code)
+        ui_idx = self.ui_lang_combo.findData(self.cfg.get("ui_language", "ja"))
+        self.ui_lang_combo.setCurrentIndex(max(0, ui_idx))
+        self.ui_lang_combo.currentIndexChanged.connect(self.on_ui_language_changed)
+        self.game_lang_label = QLabel("ゲーム言語")
+        self.game_lang_combo = QComboBox()
+        self.game_lang_combo.setMinimumWidth(90)
+        for code, label in GAME_LANGUAGES:
+            self.game_lang_combo.addItem(label, code)
+        g_idx = self.game_lang_combo.findData(self.cfg.get("game_ocr_language", "ja"))
+        self.game_lang_combo.setCurrentIndex(max(0, g_idx))
+        self.game_lang_combo.currentIndexChanged.connect(self.on_game_language_changed)
+        grid.addWidget(self.ui_lang_label, 1, 0)
+        grid.addWidget(self.ui_lang_combo, 1, 1)
+        grid.addWidget(self.game_lang_label, 1, 2)
+        grid.addWidget(self.game_lang_combo, 1, 3)
+
         self.money_invert_check = QCheckBox("所持金反転")
         self.money_invert_check.setChecked(bool(self.cfg.get("money_invert", True)))
-        grid.addWidget(self.money_invert_check, 1, 0, 1, 2)
+        grid.addWidget(self.money_invert_check, 2, 0, 1, 3)
         self.money_setting_widgets = [self.money_invert_check]
 
         self.stage_invert_check = QCheckBox("通知反転")
         self.stage_invert_check.setChecked(bool(self.cfg.get("stage_invert", True)))
-        grid.addWidget(self.stage_invert_check, 2, 0, 1, 2)
+        grid.addWidget(self.stage_invert_check, 2, 0, 1, 3)
         self.stage_setting_widgets = [self.stage_invert_check]
 
         self.money_invert_check.stateChanged.connect(self.schedule_ocr_preview)
         self.stage_invert_check.stateChanged.connect(self.schedule_ocr_preview)
-        creator_title = QLabel("アプリ開発者情報")
-        creator_title.setObjectName("section")
-        self.creator_info_lbl = QLabel(
-            f'{APP_CREATOR_NAME}  /  <a href="{APP_CREATOR_GITHUB}">GitHub</a>  /  '
-            f'<a href="{APP_CREATOR_BMAC}">Buy Me A Coffee</a>'
-        )
-        self.creator_info_lbl.setObjectName("hint")
-        self.creator_info_lbl.setOpenExternalLinks(True)
-        grid.addWidget(creator_title, 3, 0)
-        grid.addWidget(self.creator_info_lbl, 3, 1, 1, 5)
         outer.addWidget(settings)
 
         self.raw_lbl = QLabel("OCRテスト結果")
@@ -2292,24 +2300,22 @@ class MainWindow(QMainWindow):
 
         summary = QFrame()
         summary.setObjectName("pixelPanel")
-        summary.setMinimumHeight(78)
-        summary.setMaximumHeight(82)
+        summary.setMinimumHeight(56)
+        summary.setMaximumHeight(60)
         summary_l = QGridLayout(summary)
         summary_l.setContentsMargins(6, 4, 6, 4)
         summary_l.setHorizontalSpacing(6)
         summary_l.setVerticalSpacing(2)
         title = QLabel("セッション概要")
         title.setObjectName("panelTitle")
-        summary_l.addWidget(title, 0, 0, 1, 6)
+        summary_l.addWidget(title, 0, 0, 1, 2)
         self.session_start_lbl = QLabel("開始時刻: -")
         self.session_elapsed_lbl = QLabel("経過時間: -")
-        self.session_gain_lbl = QLabel("総増加G: -")
-        self.session_avg_gph_lbl = QLabel("平均GPH: -")
         self.session_runs_lbl = QLabel("総周回数: -")
         self.session_accept_lbl = QLabel("受理/全体: -")
-        for i, lab in enumerate([self.session_start_lbl, self.session_elapsed_lbl, self.session_gain_lbl, self.session_avg_gph_lbl, self.session_runs_lbl, self.session_accept_lbl]):
+        for i, lab in enumerate([self.session_start_lbl, self.session_elapsed_lbl, self.session_runs_lbl, self.session_accept_lbl]):
             lab.setObjectName("statusLine")
-            summary_l.addWidget(lab, 1 + i // 3, i % 3)
+            summary_l.addWidget(lab, 1 + i // 2, i % 2)
         lay.addWidget(summary)
 
         controls = QHBoxLayout()
@@ -2322,14 +2328,6 @@ class MainWindow(QMainWindow):
         reset_hist.setObjectName("ghost")
         reset_hist.clicked.connect(self.reset_stage_history)
         controls.addWidget(reset_hist)
-        export = QPushButton("CSV出力")
-        export.setObjectName("saveBtn")
-        export.clicked.connect(self.export_csv)
-        controls.addWidget(export)
-        open_folder = QPushButton("保存先を開く")
-        open_folder.setObjectName("ghost")
-        open_folder.clicked.connect(self.open_export_folder)
-        controls.addWidget(open_folder)
         controls.addStretch(1)
         lay.addLayout(controls)
         log_title = QLabel("履歴（直近10件）")
@@ -2348,12 +2346,6 @@ class MainWindow(QMainWindow):
         self.log_stage_table.setMaximumHeight(154)
         self.log_stage_table.verticalHeader().setDefaultSectionSize(18)
         lay.addWidget(self.log_stage_table, 2)
-        self.debug_last_lbl = QLabel("最後のOCR: -")
-        self.debug_last_lbl.setObjectName("raw")
-        self.debug_last_lbl.setWordWrap(True)
-        self.debug_last_lbl.setMinimumHeight(54)
-        self.debug_last_lbl.setMaximumHeight(58)
-        lay.addWidget(self.debug_last_lbl, 1)
         self.tabs.addTab(tab, "セッション / ログ")
         self.refresh_session_log_table()
 
@@ -2753,14 +2745,10 @@ class MainWindow(QMainWindow):
         if not self.session_id or not self.session_start_ts:
             self.session_start_lbl.setText("開始時刻: -")
             self.session_elapsed_lbl.setText("経過時間: -")
-            self.session_gain_lbl.setText("総増加G: -")
-            self.session_avg_gph_lbl.setText("平均GPH: -")
             self.session_runs_lbl.setText("総周回数: -")
             self.session_accept_lbl.setText("受理/全体: -")
             return
         elapsed = max(0.001, time.time() - self.session_start_ts)
-        gain = int(max(0, getattr(self, "session_positive_gain", 0)))
-        avg_gph = gain / elapsed * 3600.0
         try:
             start_text = datetime.fromtimestamp(float(self.session_start_ts)).strftime("%Y/%m/%d %H:%M:%S")
         except Exception:
@@ -2777,8 +2765,6 @@ class MainWindow(QMainWindow):
             pass
         self.session_start_lbl.setText(f"開始時刻: {start_text}")
         self.session_elapsed_lbl.setText(f"経過時間: {format_elapsed(elapsed)}")
-        self.session_gain_lbl.setText(f"総増加G: +{gain:,} G")
-        self.session_avg_gph_lbl.setText(f"平均GPH: {avg_gph:,.0f}")
         self.session_runs_lbl.setText(f"総周回数: {runs:,}")
         self.session_accept_lbl.setText(f"受理/全体: {accepted:,} / {total:,}")
 
@@ -2859,14 +2845,17 @@ class MainWindow(QMainWindow):
             "gauge_purple_ratio": float(cfg.get("gauge_purple_ratio", 0.18)),
             "gauge_min_pixels": int(cfg.get("gauge_min_pixels", 35)),
         })
-        expected = []
+        cfg["_expected_stage_candidates"] = self._current_expected_stages()
+        return cfg
+
+    def _current_expected_stages(self) -> List[str]:
+        expected: List[str] = []
         if getattr(self, "last_stage_key", None) and self.last_stage_key[0]:
             expected.append(self.last_stage_key[0])
             nxt = next_stage_after(self.last_stage_key[0])
             if nxt:
                 expected.append(nxt)
-        cfg["_expected_stage_candidates"] = expected
-        return cfg
+        return expected
 
     def save_settings(self):
         self.sync_runtime_cfg_from_ui()
@@ -2878,9 +2867,6 @@ class MainWindow(QMainWindow):
         self.cfg = self.build_runtime_cfg()
 
     def refresh_roi_state(self):
-        target = ROI_LABELS.get(self.current_roi_target, self.current_roi_target)
-        auto_ok = bool(self.cfg.get("anchor_roi")) or bool(self.cfg.get("auto_rois_enabled", True))
-        self.roi_state_lbl.setText(f"対象: {target} / {'自動ROI' if auto_ok else '未設定'}")
         if hasattr(self, "anchor_saved_lbl"):
             gs = self.cfg.get("detected_game_scale")
             if self.cfg.get("anchor_enabled", True):
@@ -2914,13 +2900,10 @@ class MainWindow(QMainWindow):
         """Show only the OCR settings relevant to the selected target."""
         is_money = self.current_roi_target == "money"
         is_stage_like = self.current_roi_target in ("stage_num", "stage_time", "stage")
-        is_gauge = self.current_roi_target == "gauge"
         for w in getattr(self, "money_setting_widgets", []):
             w.setVisible(is_money)
         for w in getattr(self, "stage_setting_widgets", []):
             w.setVisible(is_stage_like)
-        if hasattr(self, "gauge_info_panel"):
-            self.gauge_info_panel.setVisible(is_gauge)
         if hasattr(self, "orig_preview"):
             if self.current_roi_target == "stage_num":
                 self.orig_preview.setToolTip("ステージ番号のみの自動範囲を表示します。")
@@ -2928,8 +2911,6 @@ class MainWindow(QMainWindow):
                 self.orig_preview.setToolTip("秒数のみの自動範囲を表示します。")
             else:
                 self.orig_preview.setToolTip("")
-        if is_gauge:
-            self.update_gauge_detection_info()
 
     def update_gauge_detection_info(
         self,
@@ -3177,29 +3158,49 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "OCRエラー", str(e))
 
     def request_gauge_tick(self):
-        if not self.running or not self.session_id or self.gauge_busy:
+        if not self.running or not self.session_id:
             return
+        if self.gauge_busy:
+            # ワーカーのコールバックが失われた場合の保険。固まったままにしない。
+            if time.time() - (self.gauge_busy_since or 0.0) <= 10.0:
+                return
+            self.gauge_busy = False
         self.gauge_busy = True
-        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
-        if cfg.get("gauge_roi"):
-            cfg["_direct_gauge_capture"] = True
-            cfg["_runtime_rois_ready"] = True
-        worker = GaugeWorker(int(self.monitor_combo.currentData()), cfg)
-        worker.signals.finished.connect(self.on_gauge_finished)
-        self.pool.start(worker)
+        self.gauge_busy_since = time.time()
+        try:
+            cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
+            if cfg.get("gauge_roi"):
+                cfg["_direct_gauge_capture"] = True
+                cfg["_runtime_rois_ready"] = True
+            worker = GaugeWorker(int(self.monitor_combo.currentData()), cfg)
+            worker.signals.finished.connect(self.on_gauge_finished)
+            self.pool.start(worker)
+        except Exception as exc:
+            self.gauge_busy = False
+            self.status.showMessage(f"ゲージ監視エラー: {exc}")
 
     def request_ocr_purpose(self, purpose: str) -> bool:
         if not self.running or not self.session_id:
             return False
         if self.ocr_busy:
-            if purpose == "stage_finish":
-                self.pending_ocr_purpose = "stage_finish"
-            return False
+            # ワーカーのコールバックが失われた場合の保険。固まったままにしない。
+            if time.time() - (self.ocr_busy_since or 0.0) <= 20.0:
+                if purpose == "stage_finish":
+                    self.pending_ocr_purpose = "stage_finish"
+                return False
+            self.ocr_busy = False
         self.ocr_busy = True
-        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
-        worker = OcrWorker(int(self.monitor_combo.currentData()), cfg, self.last_money, purpose)
-        worker.signals.finished.connect(self.on_worker_finished)
-        self.pool.start(worker)
+        self.ocr_busy_since = time.time()
+        try:
+            cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
+            cfg["_expected_stage_candidates"] = self._current_expected_stages()
+            worker = OcrWorker(int(self.monitor_combo.currentData()), cfg, self.last_money, purpose)
+            worker.signals.finished.connect(self.on_worker_finished)
+            self.pool.start(worker)
+        except Exception as exc:
+            self.ocr_busy = False
+            self.status.showMessage(f"OCR起動エラー: {exc}")
+            return False
         return True
 
     def _refresh_stage_views(self):
@@ -3250,6 +3251,8 @@ class MainWindow(QMainWindow):
         self.gold_decreased_during_stage = False
         self.last_finish_transition_ts = 0.0
         self.pending_ocr_purpose = None
+        self.finish_ocr_error_count = 0
+        self._pending_money = None
         self._set_stage_wait_start()
 
     def _persist_session_start(self, result: MoneyOCRResult):
@@ -3279,6 +3282,20 @@ class MainWindow(QMainWindow):
         note = ""
         if result.money is None:
             return accepted, note
+        # 単発のOCR誤読(余分な桁など)で所持金が跳ね上がると、増加G/GPH/直近5分が壊れる。
+        # 大きな上振れは1フレームで信用せず、次の読み取りで同程度の値が再確認できたときだけ採用する。
+        # 一過性のスパイクは保留して統計に入れない(last_money/サンプル/gainを更新しない)。
+        prev_for_spike = self.last_money
+        if prev_for_spike is not None and int(result.money) > prev_for_spike:
+            jump = int(result.money) - int(prev_for_spike)
+            if int(result.money) >= prev_for_spike * 1.5 and jump >= 50000:
+                pending = getattr(self, "_pending_money", None)
+                if pending is not None and abs(int(result.money) - pending) <= max(1, int(pending * 0.02)):
+                    self._pending_money = None  # 2連続で同程度の高値 → 本物の増加として採用
+                else:
+                    self._pending_money = int(result.money)  # 初出の上振れは保留
+                    return 0, "money_spike_held"
+        self._pending_money = None
         if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
             # Large drops can be OCR misses or real spending. Keep the live UI/sample moving,
             # but exclude the active stage from scoring so the monitor never appears frozen.
@@ -3307,11 +3324,11 @@ class MainWindow(QMainWindow):
     def _persist_worker_sample(self, result: WorkerResult, accepted: int, note: str):
         if not self.session_id:
             return
-            with db_connect() as con:
-                con.execute(
-                    "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
-                    (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note),
-                )
+        with db_connect() as con:
+            con.execute(
+                "INSERT INTO samples(session_id, ts, ts_iso, money, raw_text, accepted, note) VALUES(?,?,?,?,?,?,?)",
+                (self.session_id, result.ts, now_iso(), result.money, result.money_raw, accepted, note),
+            )
 
     def _handle_worker_purpose(self, result: WorkerResult):
         if result.purpose == "stage_start":
@@ -3321,6 +3338,7 @@ class MainWindow(QMainWindow):
                 self.gold_decreased_during_stage = False
             return
         if result.purpose == "stage_finish":
+            self.finish_ocr_error_count = 0
             self.commit_stage_from_finish_ocr(result)
 
     def _show_worker_debug(self, result: WorkerResult):
@@ -3328,8 +3346,6 @@ class MainWindow(QMainWindow):
             return
         debug_text = f"[{result.purpose}] 所持金: {result.money} / {result.money_raw}\nステージ/秒数: {result.stage} / {result.duration_sec}秒 / {result.stage_raw}"
         self.raw_lbl.setText(debug_text)
-        if hasattr(self, "debug_last_lbl"):
-            self.debug_last_lbl.setText("最後のOCR: " + debug_text)
 
     # Stage state machine entrypoint. UI changes should not alter this flow casually.
     def begin_stage_run(self, ts: float, source: str = "gauge"):
@@ -3408,25 +3424,29 @@ class MainWindow(QMainWindow):
             return
         if self.stage_state in ("FINISHING", "FINISH_PENDING"):
             # Wait for finish OCR to commit. The current purple state will become next RUNNING after commit.
+            # ただし終了OCRのコールバック消失や連続エラーで停滞した場合は、ゲージ側から計測を再開する
+            # (ここが固まると以後の所持金・ステージ更新がすべて止まる)。
+            anchor_ts = float(self.pending_stage_finish_ts or self.last_finish_transition_ts or 0.0)
+            if anchor_ts and result.ts - anchor_ts > 25.0:
+                self.status.showMessage("終了処理が停滞したため計測を再開します")
+                self.finish_ocr_error_count = 0
+                self._set_stage_running(self.last_money, result.ts)
             return
 
-    def correct_stage_for_context(self, stage: Optional[str], raw_text: str = "") -> Optional[str]:
+    def correct_stage_for_context(self, stage: Optional[str], raw_text: str = "", candidates: Optional[List[str]] = None) -> Optional[str]:
         """Correct obvious stage OCR slips using recent stage context.
 
         Example: the font can read 2-1 as 2-7.  If the previous/expected stage is
-        2-1, keep 2-1 instead of logging a sudden jump to 2-7.
+        2-1, keep 2-1 instead of logging a sudden jump to 2-7. When the full
+        per-variant candidate list is available, the majority vote re-runs here
+        with commit-time context instead of judging a single value.
         """
         if not stage:
             return None
         if not is_valid_stage(stage):
             return None
-        expected: List[str] = []
-        if self.last_stage_key and self.last_stage_key[0]:
-            expected.append(self.last_stage_key[0])
-            nxt = next_stage_after(self.last_stage_key[0])
-            if nxt:
-                expected.append(nxt)
-        corrected = choose_stage_candidate([stage], {"_expected_stage_candidates": expected})
+        cand_list = [c for c in (candidates or []) if is_valid_stage(c)] or [stage]
+        corrected = choose_stage_candidate(cand_list, {"_expected_stage_candidates": self._current_expected_stages()})
         if corrected != stage:
             self.status.showMessage(f"ステージOCR補正: {stage}→{corrected}")
         return corrected
@@ -3453,10 +3473,9 @@ class MainWindow(QMainWindow):
         if start_gold is None:
             start_gold = end_money
         measured_elapsed = int(max(1, round(result.ts - self.current_stage_start_ts))) if self.current_stage_start_ts else None
-        dur = int(result.duration_sec or measured_elapsed or 0) or None
-        if dur is not None and not (DURATION_MIN_SEC <= int(dur) <= DURATION_MAX_SEC):
-            dur = int(measured_elapsed or 0) or None
-        stage = self.correct_stage_for_context(result.stage, result.stage_raw)
+        ocr_durs = list(result.duration_candidates) or ([int(result.duration_sec)] if result.duration_sec else [])
+        dur = choose_commit_duration(ocr_durs, measured_elapsed)
+        stage = self.correct_stage_for_context(result.stage, result.stage_raw, result.stage_candidates)
         delta = int(end_money - start_gold)
         if delta < 0 or getattr(self, "gold_decreased_during_stage", False):
             # Spending gold during/around the run makes the clear efficiency unknowable from holdings.
@@ -3583,6 +3602,9 @@ class MainWindow(QMainWindow):
         self._refresh_stage_views()
         self.update_stats(res.money)
         self.gauge_timer.start(900)
+        # 所持金/増加G/平均GPHをステージ境界だけでなく定期的に更新する。
+        # 間隔は poll_interval 設定を再利用（未設定なら2秒）。tick はステージ履歴を作らない。
+        self.ocr_timer.start(max(500, int(float(self.cfg.get("poll_interval", 2.0)) * 1000)))
         self.request_gauge_tick()
 
     # Session shutdown also finalizes aggregates in the DB; keep UI-only edits out of here.
@@ -3603,16 +3625,12 @@ class MainWindow(QMainWindow):
         self.status.showMessage("停止しました")
 
     def request_ocr_tick(self):
-        if not self.running or not self.session_id or self.ocr_busy:
+        if not self.running or not self.session_id:
             return
         if self.stage_state in ("FINISH_PENDING", "FINISHING"):
             self.request_ocr_purpose("stage_finish")
             return
-        self.ocr_busy = True
-        cfg = dict(self.runtime_cfg_cache or self.build_runtime_cfg())
-        worker = OcrWorker(int(self.monitor_combo.currentData()), cfg, self.last_money, "tick")
-        worker.signals.finished.connect(self.on_worker_finished)
-        self.pool.start(worker)
+        self.request_ocr_purpose("tick")
 
     def recent_packet_pulse_age(self, ts: float) -> Optional[float]:
         """Return seconds since the latest packet pulse near this OCR result.
@@ -3638,14 +3656,14 @@ class MainWindow(QMainWindow):
             return
         if result.error:
             self.status.showMessage(f"OCRエラー: {result.error}")
-            return
-        accepted, note = self._apply_money_result(result)
-        self._persist_worker_sample(result, accepted, note)
-        self._handle_worker_purpose(result)
-        # jp21: 通常OCR tickではステージ履歴を作らない。
-        # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
-        # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
-        self._show_worker_debug(result)
+        else:
+            accepted, note = self._apply_money_result(result)
+            self._persist_worker_sample(result, accepted, note)
+            self._handle_worker_purpose(result)
+            # jp21: 通常OCR tickではステージ履歴を作らない。
+            # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
+            # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
+            self._show_worker_debug(result)
         pending = self.pending_ocr_purpose
         self.pending_ocr_purpose = None
         if self.running and pending == "stage_finish":
@@ -3654,8 +3672,20 @@ class MainWindow(QMainWindow):
             # 次イベントループで終了OCRを再試行。これが2周目以降が出ない主因だった
             # 「終了検知時に通常OCR中でFINISHINGに固まる」状態を防ぐ。
             QTimer.singleShot(40, lambda: self.finish_stage_run(float(self.pending_stage_finish_ts or time.time())))
+        elif self.running and result.error and self.stage_state == "FINISHING":
+            # 終了OCRが一時的なエラー(キャプチャ失敗等)で返っても、ここで復旧しないと
+            # FINISHINGのまま全計測が固まる。数回再試行し、ダメならこの周回は諦めて続行。
+            self.finish_ocr_error_count += 1
+            if self.finish_ocr_error_count <= 3:
+                QTimer.singleShot(300, lambda: self.request_ocr_purpose("stage_finish"))
+            else:
+                self.finish_ocr_error_count = 0
+                self.status.showMessage("終了OCR連続失敗: この周回は記録せず計測を続行します")
+                self._set_stage_running(self.last_money, time.time())
 
     def set_stage_table_headers(self, headers: List[str]):
+        if not hasattr(self, "stage_table"):
+            return
         translated = [self._tr(h) if hasattr(self, "_tr") else h for h in headers]
         current = [self.stage_table.horizontalHeaderItem(i).text() for i in range(self.stage_table.columnCount()) if self.stage_table.horizontalHeaderItem(i)]
         if self.stage_table.columnCount() != len(headers) or current != translated:
@@ -3690,8 +3720,10 @@ class MainWindow(QMainWindow):
             self.resize(max(self.width(), 700), 300)
 
     def refresh_stage_summary_table(self):
-        """Show only completed-stage rows. No time bucket aggregation."""
+        """Refresh session summary labels. The 計測 tab no longer renders a per-run
+        table; the full run history lives in the セッション / ログ tab."""
         if not hasattr(self, "stage_table"):
+            self.update_session_summary_labels()
             return
         self.set_stage_table_headers(["時刻", "ステージ", "秒", "GPS", "GPH", "増加G"])
         self.stage_table.setSortingEnabled(False)
@@ -3878,23 +3910,17 @@ class MainWindow(QMainWindow):
         self.update_efficiency_detail(data)
 
     def update_recommendation(self):
+        # ★オススメはサマリーバー (recommend_lbl) のみに表示する。展開トグルは開閉用の
+        # 汎用ラベルに固定し、推奨の二重表示を避ける。
         if not hasattr(self, "recommend_lbl"):
             return
         data = self._stage_efficiency_rows()
         if not data:
-            text = "★オススメ -"
-            self.recommend_lbl.setText(text)
-            if hasattr(self, "recommend_toggle_btn"):
-                marker = "▲" if getattr(self, "recommend_body", None) and self.recommend_body.isVisible() else "▼"
-                self.recommend_toggle_btn.setText(f"{marker} {text}")
+            self.recommend_lbl.setText("★オススメ -")
             return
         stage, (gps, gph, adopted, total, dur, delta) = max(data.items(), key=lambda kv: kv[1][1])
         runh = (3600.0 / dur) if dur else 0.0
-        text = f"★オススメ {stage} / GPS {gps:,.2f} / GPH {gph:,.0f} / {runh:,.1f}周"
-        self.recommend_lbl.setText(text)
-        if hasattr(self, "recommend_toggle_btn"):
-            marker = "▲" if getattr(self, "recommend_body", None) and self.recommend_body.isVisible() else "▼"
-            self.recommend_toggle_btn.setText(f"{marker} {text}")
+        self.recommend_lbl.setText(f"★オススメ {stage} / GPS {gps:,.2f} / GPH {gph:,.0f} / {runh:,.1f}周")
 
     def reset_selected_efficiency_stage(self):
         stage = getattr(self, "selected_eff_stage", None)
@@ -4129,38 +4155,6 @@ class MainWindow(QMainWindow):
         self.session_positive_gain = 0
         self.update_stats(self.last_money)
         self.status.showMessage("基準を現在所持金にリセット")
-
-    def export_csv(self):
-        if not self.session_id:
-            QMessageBox.information(self, "セッションなし", "計測セッションがありません。")
-            return
-        EXPORT_DIR.mkdir(exist_ok=True)
-        out1 = EXPORT_DIR / f"stage_runs_{self.session_id}.csv"
-        out2 = EXPORT_DIR / f"money_samples_{self.session_id}.csv"
-        with db_connect() as con:
-            with out1.open("w", encoding="utf-8-sig", newline="") as f:
-                wr = csv.writer(f)
-                wr.writerow(["session_id", "ts_iso", "stage", "duration_sec", "gold", "gold_delta", "gps", "gph", "raw_text"])
-                for row in con.execute("SELECT session_id, ts_iso, stage, duration_sec, money, money_delta, mps, mph, raw_text FROM stage_runs WHERE session_id=? ORDER BY ts", (self.session_id,)):
-                    wr.writerow(row)
-            with out2.open("w", encoding="utf-8-sig", newline="") as f:
-                wr = csv.writer(f)
-                wr.writerow(["session_id", "ts_iso", "money", "raw_text", "accepted", "note"])
-                for row in con.execute("SELECT session_id, ts_iso, money, raw_text, accepted, note FROM samples WHERE session_id=? ORDER BY ts", (self.session_id,)):
-                    wr.writerow(row)
-        QMessageBox.information(self, "CSV出力", f"{out1}\n{out2}")
-
-    def open_export_folder(self):
-        try:
-            EXPORT_DIR.mkdir(exist_ok=True)
-            ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(EXPORT_DIR)))
-        except Exception as e:
-            self.status.showMessage(f"保存先フォルダエラー: {e}")
-            return
-        if ok:
-            self.status.showMessage(f"保存先フォルダを開きました: {EXPORT_DIR}")
-        else:
-            self.status.showMessage(f"保存先フォルダを開けませんでした: {EXPORT_DIR}")
 
 
 def main():
