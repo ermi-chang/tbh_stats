@@ -14,6 +14,7 @@ config.json
 .cursor/
 build/
 dist/
+scripts/_ocr_bench/
 *.spec
 *.md
 !README.md
