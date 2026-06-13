@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from .digit_ocr import MIN_SAMPLES_PER_DIGIT, get_money_ocr_engine
+from .window_capture import capture_game_window
 from .runtime_env import (
     DEFAULT_ANCHOR_TEMPLATE,
     DEFAULT_BOSS_TEMPLATE,
@@ -378,30 +379,29 @@ def pil_to_pixmap(img: Image.Image, max_w: int = 240, max_h: int = 95) -> QPixma
     return QPixmap.fromImage(pil_to_qimage(img))
 
 
-def capture_monitor(monitor_index: int) -> Image.Image:
-    with mss.mss() as sct:
-        monitors = sct.monitors
-        if monitor_index >= len(monitors):
-            monitor_index = 1
-        shot = sct.grab(monitors[monitor_index])
-        return Image.frombytes("RGB", shot.size, shot.rgb)
+def capture_monitor(monitor_index: int = 0) -> Optional[Image.Image]:
+    """TaskBarHero のゲーム窓を取得して PIL(RGB) を返す（見つからなければ None）。
+
+    旧実装は mss でモニタ丸ごとを取得していたが、hwnd+PrintWindow の窓キャプチャへ置換した
+    （4Kフリーズ解消・背景取得・モニタ選択不要）。monitor_index は後方互換のため引数に残すが未使用。
+    """
+    return capture_game_window()
 
 
-def capture_monitor_region(monitor_index: int, roi: Tuple[int, int, int, int]) -> Image.Image:
-    with mss.mss() as sct:
-        monitors = sct.monitors
-        if monitor_index >= len(monitors):
-            monitor_index = 1
-        mon = monitors[monitor_index]
-        x, y, w, h = map(int, roi)
-        region = {
-            "left": int(mon["left"]) + max(0, x),
-            "top": int(mon["top"]) + max(0, y),
-            "width": max(1, w),
-            "height": max(1, h),
-        }
-        shot = sct.grab(region)
-        return Image.frombytes("RGB", shot.size, shot.rgb)
+def capture_monitor_region(monitor_index: int, roi: Tuple[int, int, int, int]) -> Optional[Image.Image]:
+    """ゲーム窓を取得し、窓相対 ROI を切り出して返す（見つからなければ None）。
+
+    窓キャプチャ化に伴い ROI 座標は窓相対になったため、窓全体を取得してからローカルに crop する。
+    """
+    img = capture_game_window()
+    if img is None:
+        return None
+    x, y, w, h = map(int, roi)
+    x = max(0, min(x, img.width - 1))
+    y = max(0, min(y, img.height - 1))
+    w = max(1, min(w, img.width - x))
+    h = max(1, min(h, img.height - y))
+    return img.crop((x, y, x + w, y + h))
 
 
 def crop_roi(img: Image.Image, roi: Tuple[int, int, int, int]) -> Image.Image:
@@ -1677,6 +1677,9 @@ class OcrWorker(QRunnable):
                 self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", "tesseract.exe が見つかりません。OCR調整タブで tesseract.exe を指定してください。", self.purpose))
                 return
             img = capture_monitor(self.monitor_index)
+            if img is None:
+                self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", "ゲーム窓が見つかりません（TaskBarHero 未起動?）", self.purpose))
+                return
             runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
             money_res = MoneyOCRResult(None, "所持金範囲なし")
             stage_res = StageOCRResult(None, None, "通知範囲なし")
@@ -1752,10 +1755,16 @@ class GaugeWorker(QRunnable):
             roi = self.cfg.get("gauge_roi")
             if roi and self.cfg.get("_direct_gauge_capture"):
                 crop = capture_monitor_region(self.monitor_index, tuple(roi))
+                if crop is None:
+                    self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "ゲーム窓なし"))
+                    return
                 state, fill, blue, purple, raw = detect_gauge_state(crop, self.cfg)
                 self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
                 return
             img = capture_monitor(self.monitor_index)
+            if img is None:
+                self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "ゲーム窓なし"))
+                return
             runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
             roi = runtime_cfg.get("gauge_roi")
             if not roi:
@@ -1798,6 +1807,9 @@ class AnchorProbeWorker(QRunnable):
                 self.signals.finished.emit(ProbeResult(None, None, False, "", "tesseract"))
                 return
             img = capture_monitor(self.monitor_index)
+            if img is None:
+                self.signals.finished.emit(ProbeResult(None, None, False, "", None))
+                return
             runtime_cfg = apply_anchor_rois(img, self.cfg)
             if not runtime_cfg.get("money_roi"):
                 self.signals.finished.emit(ProbeResult(runtime_cfg, None, False, "", None))
@@ -2334,15 +2346,20 @@ class MainWindow(QMainWindow):
         tl.setHorizontalSpacing(5)
         tl.setVerticalSpacing(5)
 
+        # 窓キャプチャ(hwnd+PrintWindow)化によりモニタ選択は不要になった。互換のため combo は内部に
+        # 残す（currentData() を参照する箇所があるため）が、UIには出さず代わりに自動検出の案内を表示する。
         self.monitor_combo = QComboBox()
         self.monitor_combo.setMinimumWidth(220)
         with mss.mss() as sct:
             for i, mon in enumerate(sct.monitors):
                 label = f"全画面 {mon['width']}x{mon['height']}" if i == 0 else f"画面{i} {mon['width']}x{mon['height']}"
                 self.monitor_combo.addItem(label, i)
+        self.monitor_combo.hide()
         self.monitor_label = QLabel("対象画面")
-        tl.addWidget(self.monitor_label, 0, 0)
-        tl.addWidget(self.monitor_combo, 0, 1, 1, 4)
+        self.monitor_label.hide()
+        self.target_window_lbl = QLabel("対象: TaskBarHero ウィンドウ（自動検出）")
+        self.target_window_lbl.setObjectName("hint")
+        tl.addWidget(self.target_window_lbl, 0, 0, 1, 5)
         self.monitor_combo.currentIndexChanged.connect(self.update_dashboard_environment)
 
         self.auto_anchor_btn = QPushButton("自動設定")
@@ -3146,6 +3163,9 @@ class MainWindow(QMainWindow):
         try:
             idx = int(self.monitor_combo.currentData())
             img = capture_monitor(idx)
+            if img is None:
+                self.status.showMessage("自動設定失敗: ゲーム窓が見つかりません（TaskBarHero 未起動?）")
+                return False
             self.current_screenshot = img
             probe_cfg = self.build_runtime_cfg()
             probe_cfg["anchor_enabled"] = True
@@ -3194,6 +3214,9 @@ class MainWindow(QMainWindow):
         try:
             idx = int(self.monitor_combo.currentData())
             self.current_screenshot = capture_monitor(idx)
+            if self.current_screenshot is None:
+                QMessageBox.warning(self, "スクショ失敗", "ゲーム窓が見つかりません（TaskBarHero を起動してください）。")
+                return
             dlg = RoiSelectionDialog(self, self.current_screenshot, self.current_roi_target, self.cfg, float(getattr(self, "view_scale_value", 1.0)))
             if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_roi:
                 self.cfg[f"{self.current_roi_target}_roi"] = list(dlg.saved_roi)
@@ -3218,6 +3241,9 @@ class MainWindow(QMainWindow):
         try:
             idx = int(self.monitor_combo.currentData())
             self.current_screenshot = capture_monitor(idx)
+            if self.current_screenshot is None:
+                self.status.showMessage("スクショ失敗: ゲーム窓が見つかりません")
+                return
             self.redisplay_screenshot()
             self.update_ocr_preview()
             self.status.showMessage("スクショ取得")
@@ -3260,6 +3286,8 @@ class MainWindow(QMainWindow):
                 self.current_screenshot = capture_monitor(int(self.monitor_combo.currentData()))
             except Exception:
                 return None
+        if not self.current_screenshot:
+            return None
         roi = self.cfg.get(f"{self.current_roi_target}_roi")
         if not roi:
             return None
@@ -3301,6 +3329,9 @@ class MainWindow(QMainWindow):
         try:
             idx = int(self.monitor_combo.currentData())
             img = capture_monitor(idx)
+            if img is None:
+                QMessageBox.warning(self, "OCRテスト", "ゲーム窓が見つかりません（TaskBarHero を起動してください）。")
+                return
             runtime_cfg = apply_anchor_rois(img, self.build_runtime_cfg())
             msgs = []
             if runtime_cfg.get("_anchor_status"):
