@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .digit_ocr import MIN_SAMPLES_PER_DIGIT, get_money_ocr_engine
 from .runtime_env import (
     DEFAULT_ANCHOR_TEMPLATE,
     DEFAULT_BOSS_TEMPLATE,
@@ -320,6 +321,8 @@ def init_db() -> None:
 class MoneyOCRResult:
     money: Optional[int]
     raw_text: str
+    # 全前処理が同一値に一致した高信頼読みか（テンプレ自己学習の教師に使う）。
+    consensus: bool = False
 
 
 @dataclass
@@ -344,6 +347,7 @@ class WorkerResult:
     stage_candidates: List[str] = field(default_factory=list)
     duration_candidates: List[int] = field(default_factory=list)
     money_source: str = "main"  # "main"=上部HUD / "rune"=ルーン画面内の所持金枠
+    money_consensus: bool = False  # tesseract全閾値一致の高信頼読みか（ROI自己修復判定用）
 
 
 @dataclass
@@ -685,7 +689,8 @@ def locate_secondary_anchor(img: Image.Image, cfg: dict, primary_xy: Tuple[float
     th0, tw0 = tpl_gray0.shape[:2]
     if tw0 < 6 or th0 < 6:
         return None
-    min_score = float(cfg.get("rune_coin_min_score", cfg.get("anchor_min_score", 0.62)))
+    # 既定をHUDアンカーより高めにする。低スコアの偽コイン(0.79前後)による誤検出を抑える保険。
+    min_score = float(cfg.get("rune_coin_min_score", 0.80))
     base = float(scale or 1.0)
     best = None
     for sc in sorted(set(round(base * f, 4) for f in (0.9, 1.0, 1.1) if base * f > 0)):
@@ -1245,6 +1250,9 @@ def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int])
                 results.append((money, f"{label}:{raw}"))
     if not results:
         return MoneyOCRResult(None, " / ".join(raws))
+    # 全前処理が同一値に一致したか（テンプレ自己学習の教師に使う高信頼判定）。
+    parsed_values = [r[0] for r in results]
+    consensus = len(parsed_values) >= 3 and len(set(parsed_values)) == 1
     if last_money:
         sane = [r for r in results if last_money * 0.5 <= r[0] <= last_money * 3]
         if sane:
@@ -1255,7 +1263,32 @@ def ocr_money_from_crop(crop: Image.Image, cfg: dict, last_money: Optional[int])
     else:
         # 初回など基準が無いときは従来どおり桁数の長い/大きい値を採用。
         results.sort(key=lambda r: (len(str(r[0])), r[0]), reverse=True)
-    return MoneyOCRResult(results[0][0], f"{results[0][1]!r} => {results[0][0]}")
+    return MoneyOCRResult(results[0][0], f"{results[0][1]!r} => {results[0][0]}", consensus=consensus)
+
+
+def ocr_money_hybrid(crop: Image.Image, cfg: dict, last_money: Optional[int], engine) -> MoneyOCRResult:
+    """テンプレ照合(高速)＋tesseract(フォールバック/教師)の自己校正ハイブリッド所持金読取。
+
+    - 0〜9 すべてのテンプレが成熟していれば、まずテンプレ照合(≈4ms)で読む。相関ゲートと
+      last_money sane化を通れば即採用（ただし VERIFY_EVERY 回に1回は tesseract で検証＆再学習）。
+    - それ以外は従来の tesseract(5前処理) で読み、consensus 読みのみテンプレへ学習する。
+    money_source は常に "main" 相当（下流のスパイク保護・統計ロジックは不変）。raw_text に経路を残す。
+    """
+    if engine is not None:
+        force_verify = engine.tick_should_verify()
+        if not force_verify:
+            tpl_val, conf = engine.read(crop)
+            if tpl_val is not None:
+                sane = last_money is None or (last_money * 0.5 <= tpl_val <= last_money * 3)
+                if sane:
+                    return MoneyOCRResult(tpl_val, f"[tpl c={conf:.2f}] => {tpl_val}")
+    res = ocr_money_from_crop(crop, cfg, last_money)
+    if engine is not None and res.money is not None and res.consensus:
+        # consensus読みでも、前回確定値からかけ離れた一過性の誤読は教師にしない(テンプレを汚さない)。
+        sane = last_money is None or (last_money * 0.5 <= res.money <= last_money * 3)
+        if sane:
+            engine.learn(crop, res.money)
+    return res
 
 
 def ocr_stage_from_crop(crop: Image.Image, cfg: dict) -> StageOCRResult:
@@ -1649,14 +1682,18 @@ class OcrWorker(QRunnable):
             stage_res = StageOCRResult(None, None, "通知範囲なし")
             money_source = "main"
             if runtime_cfg.get("money_roi"):
-                money_res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
-            # ルーン画面表示中は上部HUDが誤読しやすい。ルーン画面内には通常と同じ金コインが2個目として
-            # 現れるので、それを探索し、見つかればそのコインから通常と同じオフセットで金額を読む。
-            # 妥当な金額が返れば「ルーン画面オープン中の正値」とみなし上部HUDの読みを置き換える。
-            rune_res = self._read_rune_money(img, runtime_cfg)
-            if rune_res is not None and rune_res.money is not None:
-                money_res = rune_res
-                money_source = "rune"
+                money_res = ocr_money_hybrid(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money, get_money_ocr_engine())
+            # ルーン画面の本来の問題は「ルーン表示中に上部HUDの読みが乱れる」こと。HUDがクリーンに
+            # 読めている間はルーン側コインを見る必要がない（通常プレイ中の誤検出で一瞬ゴミ値に落ちるのを防ぐ）。
+            # 日本語OCRが無いため「ルーン」文字判定の代わりにHUD読みの信頼度でゲートする＝実質ルーン画面ゲート。
+            hud_trusted = money_res.money is not None and (
+                str(money_res.raw_text).startswith("[tpl") or bool(getattr(money_res, "consensus", False))
+            )
+            if not hud_trusted:
+                rune_res = self._read_rune_money(img, runtime_cfg)
+                if rune_res is not None and rune_res.money is not None:
+                    money_res = rune_res
+                    money_source = "rune"
             if runtime_cfg.get("stage_num_roi") or runtime_cfg.get("stage_time_roi"):
                 stage_res = ocr_stage_split_from_image(img, runtime_cfg)
             elif runtime_cfg.get("stage_roi"):
@@ -1664,7 +1701,7 @@ class OcrWorker(QRunnable):
             self.signals.finished.emit(WorkerResult(
                 ts, money_res.money, money_res.raw_text, stage_res.stage, stage_res.duration_sec, stage_res.raw_text, None, self.purpose,
                 stage_candidates=stage_res.stage_candidates, duration_candidates=stage_res.duration_candidates,
-                money_source=money_source,
+                money_source=money_source, money_consensus=bool(getattr(money_res, "consensus", False)),
             ))
         except Exception as e:
             self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", str(e), self.purpose))
@@ -1689,6 +1726,12 @@ class OcrWorker(QRunnable):
             rect = rune_money_rect_from_coin(img, coin)
             res = ocr_money_from_crop(crop_roi(img, tuple(rect)), runtime_cfg, self.last_money)
             if res.money is None:
+                return None
+            # 妥当性ゲート: ルーン画面の所持金は実HUD所持金とほぼ一致する。基準(last_money)から大きく外れた値は
+            # コイン誤検出による偽陽性(例 1183/0)とみなして破棄する。起動直後(基準なし)もルーンは見ない。
+            if self.last_money is None:
+                return None
+            if not (self.last_money * 0.5 <= res.money <= self.last_money * 1.5):
                 return None
             return MoneyOCRResult(res.money, f"[rune coin@{coin[0]},{coin[1]} s={coin[4]:.2f}] {res.raw_text}")
         except Exception:
@@ -1723,6 +1766,47 @@ class GaugeWorker(QRunnable):
             self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
         except Exception as e:
             self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "", str(e)))
+
+
+@dataclass
+class ProbeResult:
+    runtime_cfg: Optional[dict]  # apply_anchor_rois の結果（money_roi含む）。検出失敗時None
+    money: Optional[int]
+    consensus: bool
+    raw: str
+    error: Optional[str] = None
+
+
+class AnchorProbeWorker(QRunnable):
+    """アンカー検出＋所持金読取をワーカースレッドで行う（UIスレッドを塞がないための退避）。
+
+    自動開始(計測前)とROI取り直し(計測中)の両方で使う。重い capture_monitor / apply_anchor_rois
+    (4Kで~2.3s) をUIスレッドから外すのが目的。結果は ProbeResult で返す。
+    """
+
+    def __init__(self, monitor_index: int, cfg: dict, last_money: Optional[int]):
+        super().__init__()
+        self.monitor_index = monitor_index
+        self.cfg = dict(cfg)
+        self.last_money = last_money
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            if not resolve_tesseract(self.cfg):
+                self.signals.finished.emit(ProbeResult(None, None, False, "", "tesseract"))
+                return
+            img = capture_monitor(self.monitor_index)
+            runtime_cfg = apply_anchor_rois(img, self.cfg)
+            if not runtime_cfg.get("money_roi"):
+                self.signals.finished.emit(ProbeResult(runtime_cfg, None, False, "", None))
+                return
+            runtime_cfg["_runtime_rois_ready"] = True
+            res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
+            self.signals.finished.emit(ProbeResult(runtime_cfg, res.money, bool(res.consensus), res.raw_text, None))
+        except Exception as e:
+            self.signals.finished.emit(ProbeResult(None, None, False, "", str(e)))
 
 
 class SortableItem(QTableWidgetItem):
@@ -1964,6 +2048,7 @@ class MainWindow(QMainWindow):
         self.finish_ocr_error_count = 0
         self.pending_ocr_purpose: Optional[str] = None
         self.runtime_cfg_cache: Optional[dict] = None
+        self._money_miss_streak = 0  # 連続で所持金を読めなかった回数（凍結ROIの自己修復判定用）
         self.packet_sniffer: Optional[PacketPulseSniffer] = None  # legacy unused
         self.stage_pulse_active_until = 0.0
         self.last_stage_pulse_at = 0.0
@@ -2010,14 +2095,7 @@ class MainWindow(QMainWindow):
         tab_controls_l = QHBoxLayout(self.tab_controls)
         tab_controls_l.setContentsMargins(0, 0, 0, 0)
         tab_controls_l.setSpacing(3)
-        self.start_btn = QPushButton("Start")
-        self.start_btn.setObjectName("primary")
-        self.start_btn.clicked.connect(self.start_session)
-        tab_controls_l.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setObjectName("danger")
-        self.stop_btn.clicked.connect(self.stop_session)
-        tab_controls_l.addWidget(self.stop_btn)
+        # 起動＝計測開始で確定（手動スタート/ストップは廃止）。計測は closeEvent で確定保存する。
         settings_btn = QPushButton("⚙")
         settings_btn.setObjectName("iconBtn")
         settings_btn.setToolTip("設定")
@@ -2032,6 +2110,13 @@ class MainWindow(QMainWindow):
         self.status_pill.setObjectName("pill")
         self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tab_controls_l.addWidget(self.status_pill)
+        # 所持金テンプレOCRの状態（学習中の桁数 / 高速パス稼働中）を可視化。
+        self.tpl_pill = QLabel("テンプレ学習 0/10")
+        self.tpl_pill.setObjectName("pill")
+        self.tpl_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tpl_pill.setToolTip("所持金のテンプレOCR状態。0〜10桁が成熟すると高速パス(≈120倍軽量)へ自動切替。")
+        tab_controls_l.addWidget(self.tpl_pill)
+        self._update_tpl_pill()  # 既存の学習データがあれば起動直後から正しい状態を表示
         self.tabs.setCornerWidget(self.tab_controls, Qt.Corner.TopRightCorner)
         main.addWidget(self.tabs, 1)
         self._build_home_tab()
@@ -3355,6 +3440,7 @@ class MainWindow(QMainWindow):
         self.last_finish_transition_ts = 0.0
         self.pending_ocr_purpose = None
         self.finish_ocr_error_count = 0
+        self._money_miss_streak = 0
         self._pending_money = None
         self._set_stage_wait_start()
 
@@ -3395,18 +3481,21 @@ class MainWindow(QMainWindow):
             self.last_money = result.money
             self.update_stats(result.money)
             return 1, "rune_money"
-        # 単発のOCR誤読(余分な桁など)で所持金が跳ね上がると、増加G/GPH/直近5分が壊れる。
-        # 大きな上振れは1フレームで信用せず、次の読み取りで同程度の値が再確認できたときだけ採用する。
-        # 一過性のスパイクは保留して統計に入れない(last_money/サンプル/gainを更新しない)。
+        # 単発のOCR誤読(余分な桁/桁落ち)で所持金が跳ねると、増加G/GPH/直近5分が壊れる。
+        # 上振れ・下振れどちらの大きな急変も1フレームでは信用せず、次の読み取りで同程度の値が
+        # 再確認できたときだけ採用する。一過性のスパイク(例 320000→66→320000)は保留して
+        # 統計に入れない(last_money/サンプル/gainを更新しない)。
         prev_for_spike = self.last_money
-        if prev_for_spike is not None and int(result.money) > prev_for_spike:
-            jump = int(result.money) - int(prev_for_spike)
-            if int(result.money) >= prev_for_spike * 1.5 and jump >= 50000:
+        if prev_for_spike is not None:
+            cur = int(result.money)
+            jump = abs(cur - int(prev_for_spike))
+            implausible = jump >= 50000 and (cur >= prev_for_spike * 1.5 or cur <= prev_for_spike * 0.5)
+            if implausible:
                 pending = getattr(self, "_pending_money", None)
-                if pending is not None and abs(int(result.money) - pending) <= max(1, int(pending * 0.02)):
-                    self._pending_money = None  # 2連続で同程度の高値 → 本物の増加として採用
+                if pending is not None and abs(cur - pending) <= max(1, int(pending * 0.02)):
+                    self._pending_money = None  # 2連続で同程度 → 本物の急変として採用
                 else:
-                    self._pending_money = int(result.money)  # 初出の上振れは保留
+                    self._pending_money = cur  # 初出の急変(上振れ/下振れ)は保留
                     return 0, "money_spike_held"
         self._pending_money = None
         if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
@@ -3679,29 +3768,82 @@ class MainWindow(QMainWindow):
         self.status.showMessage(action + ": " + (f"{stage} {dur}s +{delta}G" if valid else f"未確定 +{delta}G"))
 
     # Session bootstrap touches OCR, runtime ROI resolution, timers, and persistence together.
-    def start_session(self):
+    def begin_autostart(self):
+        """起動＝計測開始で確定。前提が整うまでダイアログを出さず静かにリトライする。
+
+        重いアンカー検出は AnchorProbeWorker でワーカースレッドに退避し、UIスレッドは塞がない
+        （ゴールド非表示時にウィンドウ移動が固まらないように）。
+        """
         self.save_settings()
+        self._probe_busy = False
+        self._autostart_timer = QTimer(self)
+        self._autostart_timer.timeout.connect(self._autostart_tick)
+        self._autostart_timer.start(2000)  # probeは非同期。busyガードで多重起動を防ぐ。
+        self._request_anchor_probe()  # 初回は即時に投げる
+
+    def _autostart_tick(self):
+        if self.running:
+            self._autostart_timer.stop()
+            return
+        self._request_anchor_probe()
+
+    def _request_anchor_probe(self):
+        """アンカー検出＋所持金読取をワーカーへ投げる（UIスレッドは即return）。"""
+        if getattr(self, "_probe_busy", False):
+            return
         if not resolve_tesseract(self.cfg):
-            QMessageBox.warning(self, "OCRエンジン未設定", "tesseract.exe が見つかりません。OCR調整タブの『参照』から tesseract.exe を選択してください。")
+            self.status_pill.setText("tesseract未設定")
             return
         self.tess_path.setText(self.cfg.get("tesseract_path", ""))
         try:
             idx = int(self.monitor_combo.currentData())
-            img = capture_monitor(idx)
-            runtime_cfg = apply_anchor_rois(img, self.build_runtime_cfg())
-            if not runtime_cfg.get("money_roi"):
-                QMessageBox.warning(self, "自動範囲未検出", "所持金範囲を自動計算できませんでした。設定で『自動設定』を実行してください。")
-                self.open_settings_dialog()
+        except Exception:
+            return
+        self._probe_busy = True
+        worker = AnchorProbeWorker(idx, self.build_runtime_cfg(), self.last_money)
+        worker.signals.finished.connect(self._on_probe_finished)
+        self.pool.start(worker)
+
+    def _on_probe_finished(self, res: "ProbeResult"):
+        """AnchorProbeWorker の結果をUIスレッドで処理（軽量）。"""
+        self._probe_busy = False
+        if not self.running:
+            # --- 自動開始 ---
+            if res.error == "tesseract":
+                self.status_pill.setText("tesseract未設定")
                 return
-            runtime_cfg["_runtime_rois_ready"] = True
-            self.runtime_cfg_cache = dict(runtime_cfg)
-            res = ocr_money_from_crop(crop_roi(img, tuple(runtime_cfg["money_roi"])), runtime_cfg, self.last_money)
-        except Exception as e:
-            QMessageBox.critical(self, "OCRエラー", str(e))
-            return
-        if res.money is None:
-            QMessageBox.warning(self, "OCR失敗", "開始時の所持金が読めません。設定を調整してください。")
-            return
+            if res.error:
+                self.status_pill.setText("計測準備中…")
+                return
+            if not (res.runtime_cfg and res.runtime_cfg.get("money_roi")):
+                self.status_pill.setText("範囲検出待ち")
+                return
+            # 高信頼(全閾値一致)で読めたときだけ開始する。ズレたROIの断片誤読(例 ",4"→4)で
+            # 計測を始めると、誤った基準値に固定されて以降ずっと更新が壊れるのを防ぐ。
+            if res.money is None or not res.consensus:
+                self.status_pill.setText("所持金待ち(高信頼)")
+                return
+            self.runtime_cfg_cache = dict(res.runtime_cfg)
+            self._start_session_from_result(MoneyOCRResult(res.money, res.raw, res.consensus))
+            if hasattr(self, "_autostart_timer"):
+                self._autostart_timer.stop()
+        else:
+            # --- 計測中のROI取り直し（自己修復） ---
+            if res.runtime_cfg and res.runtime_cfg.get("money_roi"):
+                self.runtime_cfg_cache = dict(res.runtime_cfg)
+            else:
+                self.runtime_cfg_cache = None  # 次tickは素のアンカー検出に委ねる
+
+    def _reacquire_rois(self):
+        """凍結ROIが古い/誤検出で所持金を読めないとき、アンカーを取り直す（非同期）。
+
+        計測中にゲーム窓が動いた・誤ROIで凍結した等を自己修復する。重い検出は
+        AnchorProbeWorker に退避し、結果は _on_probe_finished が runtime_cfg_cache に反映する。
+        """
+        self._request_anchor_probe()
+
+    def _start_session_from_result(self, res: MoneyOCRResult):
+        """高信頼の所持金読み取りからセッションを開始する（UIスレッド・軽量）。"""
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_start_ts = time.time()
         self._begin_session_runtime(session_id, session_start_ts, res)
@@ -3721,8 +3863,13 @@ class MainWindow(QMainWindow):
         self.request_gauge_tick()
 
     # Session shutdown also finalizes aggregates in the DB; keep UI-only edits out of here.
+    # アプリ終了時(closeEvent)に呼ばれ、計測集計を確定保存する。手動停止UIは廃止。
     def stop_session(self):
+        if not self.running:
+            return
         self.running = False
+        if hasattr(self, "_autostart_timer"):
+            self._autostart_timer.stop()
         if hasattr(self, "ocr_timer"):
             self.ocr_timer.stop()
         self.gauge_timer.stop()
@@ -3736,6 +3883,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "current_stage_state_lbl"):
             self.current_stage_state_lbl.setText("停止中")
         self.status.showMessage("停止しました")
+
+    def closeEvent(self, event):
+        """アプリ終了で計測を確定保存し、テンプレOCRの学習も書き出す。"""
+        try:
+            self.stop_session()
+        except Exception:
+            pass
+        try:
+            get_money_ocr_engine().flush()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def request_ocr_tick(self):
         if not self.running or not self.session_id:
@@ -3771,12 +3930,29 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"OCRエラー: {result.error}")
         else:
             accepted, note = self._apply_money_result(result)
+            # 凍結ROIが古い/誤検出だと、読めない(None)か断片の低信頼値(例 ",4")を読み続けて
+            # 無言で更新が壊れる。高信頼でない読みが連続したらROIを取り直して自己修復する。
+            # 信頼扱い: テンプレ高速パス[tpl] / ルーン枠 / tesseract全閾値一致(consensus)。
+            raw = result.money_raw or ""
+            trusted = result.money is not None and (
+                result.money_source == "rune"
+                or raw.startswith("[tpl")
+                or result.money_consensus
+            )
+            if trusted:
+                self._money_miss_streak = 0
+            else:
+                self._money_miss_streak += 1
+                if self._money_miss_streak >= 3:
+                    self._money_miss_streak = 0
+                    self._reacquire_rois()
             self._persist_worker_sample(result, accepted, note)
             self._handle_worker_purpose(result)
             # jp21: 通常OCR tickではステージ履歴を作らない。
             # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
             # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
             self._show_worker_debug(result)
+            self._update_tpl_pill(result)
         pending = self.pending_ocr_purpose
         self.pending_ocr_purpose = None
         if self.running and pending == "stage_finish":
@@ -3795,6 +3971,21 @@ class MainWindow(QMainWindow):
                 self.finish_ocr_error_count = 0
                 self.status.showMessage("終了OCR連続失敗: この周回は記録せず計測を続行します")
                 self._set_stage_running(self.last_money, time.time())
+
+    def _update_tpl_pill(self, result: Optional[WorkerResult] = None):
+        """所持金テンプレOCRの状態をピルに反映（学習進捗 / 高速パス稼働中）。"""
+        if not hasattr(self, "tpl_pill"):
+            return
+        try:
+            engine = get_money_ocr_engine()
+            if engine.is_complete():
+                used_fast = str(getattr(result, "money_raw", "")).startswith("[tpl")
+                self.tpl_pill.setText("テンプレOCR ⚡稼働中" if used_fast else "テンプレOCR ✓検証中")
+            else:
+                mature = sum(1 for c in engine.coverage().values() if c >= MIN_SAMPLES_PER_DIGIT)
+                self.tpl_pill.setText(f"テンプレ学習 {mature}/10")
+        except Exception:
+            pass
 
     def set_stage_table_headers(self, headers: List[str]):
         if not hasattr(self, "stage_table"):
@@ -4274,6 +4465,8 @@ def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    # 起動＝計測開始で確定。ウィンドウ表示後に自動開始（前提が整うまで静かにリトライ）。
+    QTimer.singleShot(0, win.begin_autostart)
     sys.exit(app.exec())
 
 
