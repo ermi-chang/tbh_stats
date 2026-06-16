@@ -189,6 +189,17 @@ class DigitTemplateOCR:
                 best_s, best_d = s, d
         return best_d, best_s
 
+    def match_glyph(self, glyph: np.ndarray) -> Tuple[int, float]:
+        """正規化済み(GLYPH_H×GLYPH_W)グリフを 0〜9 テンプレと照合し (数字, 相関) を返す。
+
+        所持金以外（ステージ番号など同一HUDフォント）の桁分類に再利用するための公開API。
+        テンプレ未生成なら (-1, -2.0)。学習との競合を避けるためロック保護する。
+        """
+        with self._lock:
+            if not self._templates:
+                return -1, -2.0
+            return self._match_digit(glyph)
+
     def read(self, crop: Image.Image) -> Tuple[Optional[int], float]:
         """テンプレ照合で所持金を読む。(値, 最小グリフ相関) を返す。
 

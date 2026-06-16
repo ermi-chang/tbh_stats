@@ -46,7 +46,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import diag
 from .digit_ocr import MIN_SAMPLES_PER_DIGIT, get_money_ocr_engine
+from .stage_ocr_templates import read_stage_from_crop
+from .telop_detector import get_telop_anchor, locate_steji_anchor, read_telop_at, gauge_roi_from_anchor
 from .window_capture import capture_game_window
 from .runtime_env import (
     DEFAULT_ANCHOR_TEMPLATE,
@@ -225,10 +228,10 @@ def source_key_from_text(text: str) -> str:
     return text
 
 # 添付してもらった default_anchor_gold.png はゲーム内スケール x1.5 の状態で切り出したもの。
-# ゲーム側の設定は x1 / x1.25 / x1.5 / x2 / x3 の5段階なので、
+# ゲーム側の倍率設定は現行版で x1 / x1.25 / x1.5 の3段階（x2 / x3 はアップデートで廃止）。
 # テンプレート照合では「現在スケール ÷ 1.5」を候補にする。
 ANCHOR_TEMPLATE_GAME_SCALE = 1.5
-SUPPORTED_GAME_SCALES = [1.0, 1.25, 1.5, 2.0, 3.0]
+SUPPORTED_GAME_SCALES = [1.0, 1.25, 1.5]
 
 def template_scale_candidates() -> List[float]:
     base = [gs / ANCHOR_TEMPLATE_GAME_SCALE for gs in SUPPORTED_GAME_SCALES]
@@ -291,6 +294,29 @@ RUNE_MONEY_OFFSET = [36, -1, 112, 31]
 # HUDコイン中心からこの距離(px, x1基準テンプレ幅換算)以内のマッチは自分自身とみなし除外。
 RUNE_COIN_MIN_SEP_FACTOR = 2.2  # 検出アンカー幅 × この係数
 
+# 増加G(session_positive_gain)を“誤読の落ち込み→回復”で水増ししないためのガード。
+# 1tickでこれ以上の増加は farming の正当な増分ではなく「直前の小さい誤値からの回復」とみなし、利得に
+# 加えずベースラインだけ追従させる（実機の所持金規模 ~10^6 に対し、正当な毎tick増分はこれを大きく下回る）。
+GAIN_SPIKE_ABS = 50000     # 絶対しきい値[G]
+GAIN_SPIKE_FRAC = 0.5      # 直前ベースライン比のしきい値
+
+# ステージ境界検知のしきい値（ゲージの“状態(state)”駆動＋立ち上がり起点）。
+# 進行ゲージは purple(進行)→ blue(完了到達)→ 空 と遷移する。完了の検知は幅ベースの blue_ratio>=GAUGE_REACH_BLUE
+# （detect_gauge_state の "blue" 状態は青12px以上で立ち purple充填中のノイズ青で誤判定し得るため width比が頑健）。
+# 【実測知見・最終】「ステージ秒の計測開始/終了」は fill値ではなく detect_gauge_state の state で判定する。
+# 理由(_play_samples/diag 解析): 別ステージ変更のメニュー/ナビ中（画面レイアウト手動セレクタ等がゲージ/箱を覆う）は
+# ゲージROIが低fillノイズ(平均0.07・最大0.19)を出すが state は ほぼ全て "unknown"（215959のナビ45poll中 purple は1のみ）。
+# 一方 本物のステージ充填は fill>=0.3 で100% "purple"。よって:
+#   ・計測開始 = state が purple/blue 系で GAUGE_ACTIVE_ARM 回連続（メニューのunknownノイズでは開始しない）。
+#     起点(current_stage_start_ts)は「ゲージが上がり始めた時刻(_fill_rise_ts)」に合わせ、立ち上がりの待機分も計測に含める。
+#   ・計測終了 = active 中に state=="unknown" かつ fill<=GAUGE_EMPTY_FILL（＝本当に空）。レイアウトメニューが
+#     ゲージを覆って unknown でも fill>EMPTY のノイズなら“継続中”とみなし誤リセットしない（点5の誤初期化を回避）。
+# これで「②ナビ中の30秒カウントアップ」「メニューでの誤初期化」「開始が遅れて待機分がずれる」を解消する。
+GAUGE_REACH_BLUE = 0.45        # blue_ratio がこの値以上なら「完了到達(クリア)」（0.78未満の満タンも拾う / ノイズ青は弾く）
+GAUGE_MISSED_CLEAR_FILL = 0.85 # 空になる直前の最大充填率がこの値以上なら「青検知を取り逃したクリア」として記録する
+GAUGE_EMPTY_FILL = 0.08        # fill がこの値以下＝ゲージ空。state=unknown かつ 空 ならステージ終了とみなす。実測 空=0.03
+GAUGE_ACTIVE_ARM = 2           # state が purple/blue 系で この回数連続したら計測開始（メニュー/ナビの単発ノイズを弾く）
+
 
 
 def now_iso() -> str:
@@ -349,6 +375,8 @@ class WorkerResult:
     duration_candidates: List[int] = field(default_factory=list)
     money_source: str = "main"  # "main"=上部HUD / "rune"=ルーン画面内の所持金枠
     money_consensus: bool = False  # tesseract全閾値一致の高信頼読みか（ROI自己修復判定用）
+    stage_kind: Optional[str] = None  # テロップ種別 "clear"=クリア / "fail"=失敗 / None=不明
+    roi_recovered: bool = False  # 凍結コインがズレを検知し当フレームだけ再検出した（→キャッシュ更新を促す）
 
 
 @dataclass
@@ -360,6 +388,7 @@ class GaugeResult:
     purple_ratio: float
     raw: str
     error: Optional[str] = None
+    roi: Optional[Tuple[int, int, int, int]] = None  # 診断用: 実際に判定したゲージROI(窓相対)
 
 
 # ---------- image helpers ----------
@@ -665,6 +694,32 @@ def locate_anchor(img: Image.Image, cfg: dict) -> Optional[Tuple[int, int, int, 
     return None
 
 
+def coin_score_at(img: Image.Image, cfg: dict) -> float:
+    """凍結コインアンカー位置で金コインがまだ一致するかのスコア（layout変化検知・安価）。
+
+    telop_detector.steji_score_at と同じ発想。anchor_roi 周辺の小領域だけを照合するので全画面探索より軽い。
+    返り値が anchor_min_score を下回ったら、配置変更等でコインが動いた＝凍結ROIが古いと判断できる。
+    """
+    anchor = cfg.get("anchor_roi")
+    template_img = _load_anchor_template(cfg)
+    if not anchor or template_img is None:
+        return -1.0
+    try:
+        x, y, w, h = (int(v) for v in anchor[:4])
+        scr_gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        tpl_gray = cv2.cvtColor(np.array(template_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        tpl_gray = cv2.resize(tpl_gray, (max(6, w), max(6, h)))
+        pad = max(6, h // 2)
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(scr_gray.shape[1], x + w + pad), min(scr_gray.shape[0], y + h + pad)
+        region = scr_gray[y0:y1, x0:x1]
+        if region.shape[0] < tpl_gray.shape[0] or region.shape[1] < tpl_gray.shape[1]:
+            return -1.0
+        return float(cv2.matchTemplate(region, tpl_gray, cv2.TM_CCOEFF_NORMED).max())
+    except Exception:
+        return -1.0
+
+
 def _clamp_roi(img: Image.Image, roi: Tuple[int, int, int, int]) -> List[int]:
     x, y, w, h = map(int, roi)
     x = max(0, min(x, img.width - 1))
@@ -728,60 +783,21 @@ def rune_money_rect_from_coin(img: Image.Image, coin: Tuple[int, int, int, int, 
 
 
 def compute_auto_rois_from_anchor(img: Image.Image, det: Tuple[int, int, int, int, float, float], cfg: dict) -> dict:
-    """Compute OCR ROIs from the detected gold icon, and gauge ROI from boss icon.
+    """金コインアイコン基準で所持金ROIを算出する。
 
-    Money/stage/time use the left-top gold icon as before.
-    Gauge uses the lower-right boss icon as an additional anchor, because the gauge itself can be
-    very thin and may be partially clipped. The boss icon is searched only inside the expected
-    lower-right region derived from the gold anchor, then the gauge rectangle is placed relative
-    to the boss icon.
+    M2.5以降、ステージ/秒数/ゲージは「ステージ」テロップアンカー基準（telop_detector）で位置決めするため、
+    本関数は所持金(コインと同一パネル内＝コイン基準が堅牢)のみを担当する。ボス基準ゲージは廃止。
     """
     ax, ay, aw, ah, score, scale = det
     out = {}
     sc = float(scale or 1.0)
-    for name, rect in AUTO_ROI_LAYOUT.items():
-        if name == "gauge":
-            continue
-        dx, dy, w, h = map(float, cfg.get(f"auto_{name}_layout", rect))
-        roi = (
-            int(round(ax + dx * sc)),
-            int(round(ay + dy * sc)),
-            int(round(w * sc)),
-            int(round(h * sc)),
-        )
-        out[f"{name}_roi"] = _clamp_roi(img, roi)
-
-    # Internal boss search area. This does not make the final gauge ROI wide; it only finds the icon.
-    bdx, bdy, bw, bh = map(float, cfg.get("boss_search_layout", BOSS_SEARCH_LAYOUT))
-    boss_search = (
-        int(round(ax + bdx * sc)),
-        int(round(ay + bdy * sc)),
-        int(round(bw * sc)),
-        int(round(bh * sc)),
-    )
-    boss = locate_boss_icon_in_roi(img, boss_search, cfg, sc)
-    if boss:
-        bx, by, bww, bhh, bscore, bscale = boss
-        gdx, gdy, gw, gh = map(float, cfg.get("boss_to_gauge_layout", BOSS_TO_GAUGE_LAYOUT))
-        gauge_roi = (
-            int(round(bx + gdx * bscale)),
-            int(round(by + gdy * bscale)),
-            int(round(gw * bscale)),
-            int(round(gh * bscale)),
-        )
-        out["gauge_roi"] = _clamp_roi(img, gauge_roi)
-        out["_boss_anchor_status"] = f"ボス基準 score={bscore:.2f} scale={bscale:.3f} x={bx} y={by}"
-    else:
-        # Fallback: previous rough gauge ROI. Used only when boss icon is not detected.
-        dx, dy, w, h = map(float, cfg.get("auto_gauge_layout", AUTO_ROI_LAYOUT["gauge"]))
-        roi = (
-            int(round(ax + dx * sc)),
-            int(round(ay + dy * sc)),
-            int(round(w * sc)),
-            int(round(h * sc)),
-        )
-        out["gauge_roi"] = _clamp_roi(img, roi)
-        out["_boss_anchor_status"] = "ボス基準未検出。旧ゲージROIを使用"
+    dx, dy, w, h = map(float, cfg.get("auto_money_layout", AUTO_ROI_LAYOUT["money"]))
+    out["money_roi"] = _clamp_roi(img, (
+        int(round(ax + dx * sc)),
+        int(round(ay + dy * sc)),
+        int(round(w * sc)),
+        int(round(h * sc)),
+    ))
     return out
 
 
@@ -791,14 +807,25 @@ def apply_anchor_rois(img: Image.Image, cfg: dict) -> dict:
     jp16: auto layout is the primary mode. It ignores stale manual ROIs when enabled.
     """
     runtime = dict(cfg)
+    # ゲーム部アンカー＝「ステージ」テロップ（コイン非依存・レイアウト堅牢）。ゲージROIをここから算出。
+    telop = locate_steji_anchor(img)
+    if telop:
+        tx, ty, tw, th, tsc, tscale = telop
+        runtime["telop_anchor"] = [int(tx), int(ty), int(tw), int(th)]
+        runtime["telop_scale"] = float(tscale)
+        runtime["gauge_roi"] = list(gauge_roi_from_anchor((tx, ty, tw, th), tscale, img.height))
+        runtime["_telop_status"] = f"テロップ基準 score={tsc:.2f} x={tx} y={ty}"
+    else:
+        for k in ("telop_anchor", "telop_scale", "gauge_roi"):
+            runtime.pop(k, None)
+        runtime["_telop_status"] = "テロップ未検出"
     det = locate_anchor(img, cfg)
     if not det:
         runtime["_anchor_status"] = "基準アイコン未検出。自動ROIを更新できません。"
         # If auto layout is enabled but anchor is missing, do not silently use stale manual ranges.
         # It is safer to fail than to read the wrong area after the game window moved.
         if bool(cfg.get("auto_rois_enabled", True)):
-            for name in ["money", "stage_num", "stage_time", "gauge", "stage"]:
-                runtime.pop(f"{name}_roi", None)
+            runtime.pop("money_roi", None)
         return runtime
 
     ax, ay, aw, ah, score, scale = det
@@ -811,8 +838,6 @@ def apply_anchor_rois(img: Image.Image, cfg: dict) -> dict:
     if bool(cfg.get("auto_rois_enabled", True)):
         auto = compute_auto_rois_from_anchor(img, det, cfg)
         runtime.update(auto)
-        if auto.get("_boss_anchor_status"):
-            runtime["_anchor_status"] = runtime["_anchor_status"] + " / " + auto.get("_boss_anchor_status", "")
         return runtime
 
     # Legacy manual-offset mode kept only for compatibility with older config.json.
@@ -1192,14 +1217,22 @@ def ocr_stage_split_from_image(img: Image.Image, cfg: dict) -> StageOCRResult:
 
     if cfg.get("stage_num_roi"):
         crop = crop_roi(img, tuple(cfg["stage_num_roi"]))
-        raws = _ocr_text_from_crop(crop, cfg, "0123456789-ー‐ ", [7, 8, 13])
-        for r in raws:
-            st = parse_stage_number_text(r)
-            raw_parts.append(f"ステージ={st or '-'} raw:{r}")
-            if st:
-                stage_candidates.append(st)
-        if stage_candidates:
+        # 一次: 所持金デジタルテンプレを再利用した高速ステージOCR（同一HUDフォント・tesseract非依存・約1ms）。
+        tpl_stage = read_stage_from_crop(crop)
+        if tpl_stage:
+            stage_candidates.append(tpl_stage)
+            raw_parts.append(f"ステージ={tpl_stage} [tpl]")
             stage = choose_stage_candidate(stage_candidates, cfg)
+        else:
+            # フォールバック: テンプレ未成熟(所持金0〜9が揃う前)/読取不可のとき tesseract で読む。
+            raws = _ocr_text_from_crop(crop, cfg, "0123456789-ー‐ ", [7, 8, 13])
+            for r in raws:
+                st = parse_stage_number_text(r)
+                raw_parts.append(f"ステージ={st or '-'} raw:{r}")
+                if st:
+                    stage_candidates.append(st)
+            if stage_candidates:
+                stage = choose_stage_candidate(stage_candidates, cfg)
 
     if cfg.get("stage_time_roi"):
         crop = crop_roi(img, tuple(cfg["stage_time_roi"]))
@@ -1680,7 +1713,19 @@ class OcrWorker(QRunnable):
             if img is None:
                 self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", "ゲーム窓が見つかりません（TaskBarHero 未起動?）", self.purpose))
                 return
-            runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
+            # 凍結ROIでも、配置変更でコインが動いていないかを毎tick安価に再確認する（telopと同じ発想）。
+            # ズレていたら当フレームだけ全画面再検出して正しい所持金を読み、本スレ側にキャッシュ更新を促す
+            # （凍結された古いROIを読み続けて所持金が小さい誤値になる→増加G水増し、を断つ）。
+            roi_recovered = False
+            if self.cfg.get("_runtime_rois_ready"):
+                min_score = float(self.cfg.get("anchor_min_score", 0.62))
+                if coin_score_at(img, self.cfg) >= min_score:
+                    runtime_cfg = self.cfg
+                else:
+                    runtime_cfg = apply_anchor_rois(img, self.cfg)
+                    roi_recovered = bool(runtime_cfg.get("money_roi"))
+            else:
+                runtime_cfg = apply_anchor_rois(img, self.cfg)
             money_res = MoneyOCRResult(None, "所持金範囲なし")
             stage_res = StageOCRResult(None, None, "通知範囲なし")
             money_source = "main"
@@ -1697,14 +1742,32 @@ class OcrWorker(QRunnable):
                 if rune_res is not None and rune_res.money is not None:
                     money_res = rune_res
                     money_source = "rune"
-            if runtime_cfg.get("stage_num_roi") or runtime_cfg.get("stage_time_roi"):
-                stage_res = ocr_stage_split_from_image(img, runtime_cfg)
-            elif runtime_cfg.get("stage_roi"):
-                stage_res = ocr_stage_from_crop(crop_roi(img, tuple(runtime_cfg["stage_roi"])), runtime_cfg)
+            # ステージ/秒数/種別は「ステージ」テロップを全画面アンカーにして読む（レイアウト非依存）。
+            # テロップ位置はキャッシュ＋安価な再確認で取得（毎tickの全画面探索を回避）。
+            stage_kind: Optional[str] = None
+            anchor = get_telop_anchor(img)
+            if anchor is not None:
+                tr = read_telop_at(img, anchor[:4], anchor[4])
+                stage_kind = tr.kind
+                stage_res = StageOCRResult(
+                    tr.stage, tr.seconds, tr.raw,
+                    [tr.stage] if tr.stage else [],
+                    [tr.seconds] if tr.seconds else [],
+                )
+            elif runtime_cfg.get("stage_num_roi") or runtime_cfg.get("stage_time_roi"):
+                stage_res = ocr_stage_split_from_image(img, runtime_cfg)  # 互換フォールバック
+            if diag.enabled():
+                diag.log(
+                    "tick_raw", purpose=self.purpose, anchor=anchor is not None,
+                    kind=stage_kind, stage=stage_res.stage, money=money_res.money,
+                    money_raw=money_res.raw_text, consensus=bool(getattr(money_res, "consensus", False)),
+                    money_src=money_source, roi_recovered=roi_recovered,
+                )
             self.signals.finished.emit(WorkerResult(
                 ts, money_res.money, money_res.raw_text, stage_res.stage, stage_res.duration_sec, stage_res.raw_text, None, self.purpose,
                 stage_candidates=stage_res.stage_candidates, duration_candidates=stage_res.duration_candidates,
                 money_source=money_source, money_consensus=bool(getattr(money_res, "consensus", False)),
+                stage_kind=stage_kind, roi_recovered=roi_recovered,
             ))
         except Exception as e:
             self.signals.finished.emit(WorkerResult(ts, None, "", None, None, "", str(e), self.purpose))
@@ -1752,27 +1815,22 @@ class GaugeWorker(QRunnable):
     def run(self):
         ts = time.time()
         try:
-            roi = self.cfg.get("gauge_roi")
-            if roi and self.cfg.get("_direct_gauge_capture"):
-                crop = capture_monitor_region(self.monitor_index, tuple(roi))
-                if crop is None:
-                    self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "ゲーム窓なし"))
-                    return
-                state, fill, blue, purple, raw = detect_gauge_state(crop, self.cfg)
-                self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
-                return
             img = capture_monitor(self.monitor_index)
             if img is None:
                 self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "ゲーム窓なし"))
                 return
-            runtime_cfg = self.cfg if self.cfg.get("_runtime_rois_ready") else apply_anchor_rois(img, self.cfg)
-            roi = runtime_cfg.get("gauge_roi")
-            if not roi:
-                self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, runtime_cfg.get("_anchor_status", "ゲージROIなし")))
+            # ゲージROIは「ステージ」テロップアンカー基準で算出（コイン/ボス固定オフセット廃止・レイアウト堅牢）。
+            anchor = get_telop_anchor(img)
+            if anchor is None:
+                self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "テロップ未検出(ゲージ位置不明)"))
                 return
+            roi = gauge_roi_from_anchor(anchor[:4], anchor[4], img.height)
             crop = crop_roi(img, tuple(roi))
-            state, fill, blue, purple, raw = detect_gauge_state(crop, runtime_cfg)
-            self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw))
+            state, fill, blue, purple, raw = detect_gauge_state(crop, self.cfg)
+            if diag.enabled():
+                diag.save_gauge_crop(ts, crop)
+                diag.save_gauge_context(ts, img, roi)
+            self.signals.finished.emit(GaugeResult(ts, state, fill, blue, purple, raw, roi=tuple(int(v) for v in roi)))
         except Exception as e:
             self.signals.finished.emit(GaugeResult(ts, "unknown", 0.0, 0.0, 0.0, "", str(e)))
 
@@ -2047,6 +2105,7 @@ class MainWindow(QMainWindow):
         self.samples: List[Tuple[float, int]] = []
         # 所持金を消費しても平均GPH/直近GPSが壊れないよう、増加分だけを累積する。
         self.session_positive_gain = 0
+        self.gain_baseline: Optional[int] = None  # 増加G累積の確定ベースライン（誤読往復の水増し防止）
         self.last_stage_money: Optional[int] = None
         self.last_stage_key: Optional[Tuple[str, int]] = None
         self.last_stage_logged_at = 0.0
@@ -2069,6 +2128,10 @@ class MainWindow(QMainWindow):
         self.gauge_state = "unknown"
         self.stage_state = "WAIT_START"
         self.stage_blue_seen = False
+        self.stage_max_fill = 0.0  # 当該挑戦で観測したゲージ最大充填率（クリア取り逃し/空判定の分類用）
+        self._stage_active = False    # ゲージが本物のステージを充填中か（ヒステリシスで確定）。falseの間ステージ秒は「-」
+        self._fill_rise_ts: Optional[float] = None  # 空→充填が始まった時刻の仮記録（active確定時の起点に使う）
+        self._active_streak = 0       # fill>=ACTIVE の連続回数（一発スパイク除去）
         self.current_stage_start_gold: Optional[int] = None
         self.current_stage_start_ts: Optional[float] = None
         self.gold_decreased_during_stage = False
@@ -2234,8 +2297,11 @@ class MainWindow(QMainWindow):
         self.gps_card = KpiGaugeCard("直近5分GPS", "◆", self.gps_gauge, THEME["green"])
         self.avg_gph_card = KpiGaugeCard("平均GPH", "◇", self.avg_gph_gauge, THEME["bar_gold"])
         self.loop_card = KpiGaugeCard("今ステージ周回/h", "↻", self.loop_gauge, THEME["warning"])
+        # ステージ秒は「裏方」化: 計測(current_stage_start_ts)は記録用に維持するが、KPIカードとしては描画しない。
+        # （表示の有無で挙動が安定しないため非表示にし、記録のクリア所要時間だけ使う。）
         self.elapsed_card = KpiGaugeCard("ステージ秒", "⌛", self.elapsed_gauge, "#55cfc1")
-        for i, card in enumerate([self.money_card, self.gain_card, self.gps_card, self.avg_gph_card, self.loop_card, self.elapsed_card]):
+        self.elapsed_card.hide()
+        for i, card in enumerate([self.money_card, self.gain_card, self.gps_card, self.avg_gph_card, self.loop_card]):
             cards.addWidget(card, 0, i)
             cards.setColumnStretch(i, 1)
         self.current_money_lbl = self.money_card.value_lbl
@@ -3431,14 +3497,43 @@ class MainWindow(QMainWindow):
     def _set_stage_wait_start(self):
         self.stage_state = "WAIT_START"
         self.stage_blue_seen = False
+        self.stage_max_fill = 0.0
         self.pending_stage_finish_ts = None
 
     def _set_stage_running(self, start_gold: Optional[int], ts: float):
+        if diag.enabled():
+            prev_ts = self.current_stage_start_ts
+            diag.log(
+                "set_running", new_start_ts=round(ts, 3), start_gold=start_gold,
+                prev_state=self.stage_state, prev_elapsed=round(ts - prev_ts, 2) if prev_ts else None,
+                max_fill=getattr(self, "stage_max_fill", 0.0), blue_seen=getattr(self, "stage_blue_seen", False),
+            )
         self.current_stage_start_gold = start_gold
         self.current_stage_start_ts = ts
         self.stage_state = "RUNNING"
         self.stage_blue_seen = False
+        self.stage_max_fill = 0.0
+        self._stage_active = True       # 計測中（ゲージがステージを充填中）
+        self._fill_rise_ts = None
+        self._active_streak = 0
         self.pending_stage_finish_ts = None
+
+    def _idle_stage(self):
+        """ステージ非アクティブ（挑戦間/メニュー/ナビ中）へ。ステージ秒は「-」表示になる（記録しない）。
+
+        失敗/手動遷移/同ステージ再開でゲージが空になった時、またはクリア後に呼ぶ。RUNNING は維持し、ゲージが
+        本物の充填(fill>=GAUGE_ACTIVE_FILL)を見せたら begin_stage_run で計測を開始する。current_stage_start_ts を
+        None にすることで、ナビ中のノイズ充填で誤カウントせず「-」を保つ（②の30秒カウントアップを根絶）。
+        """
+        self.current_stage_start_ts = None
+        self.current_stage_start_gold = None
+        self.stage_blue_seen = False
+        self.stage_max_fill = 0.0
+        self._stage_active = False
+        self._fill_rise_ts = None
+        self._active_streak = 0
+        if diag.enabled():
+            diag.log("idle_stage", ts=round(time.time(), 3))
 
     def _set_stage_finish_pending(self, ts: float):
         self.pending_stage_finish_ts = ts
@@ -3449,8 +3544,10 @@ class MainWindow(QMainWindow):
         self.last_finish_transition_ts = ts
         self.stage_state = "FINISHING"
         self.stage_blue_seen = False
+        self.stage_max_fill = 0.0
 
     def _begin_session_runtime(self, session_id: str, start_ts: float, result: MoneyOCRResult):
+        diag.log("session_start", session_id=session_id, money=result.money)
         self.session_id = session_id
         self.session_start_ts = start_ts
         self.start_money = result.money
@@ -3458,6 +3555,7 @@ class MainWindow(QMainWindow):
         self.last_stage_money = result.money
         self.samples = [(start_ts, result.money)]
         self.session_positive_gain = 0
+        self.gain_baseline = result.money  # 増加G累積の確定ベースライン（誤読往復の水増し防止）
         self.last_stage_key = None
         self.last_stage_logged_at = 0.0
         self.stage_notice_key = None
@@ -3497,6 +3595,21 @@ class MainWindow(QMainWindow):
                 (now_iso(), self.last_money, gain, elapsed, avg_mps, avg_mps * 3600, self.session_id),
             )
 
+    def _gold_decrease_is_real(self, money: Optional[int]) -> bool:
+        """所持金がステージ開始額を実際に下回ったか＝買い物等の実消費か。
+
+        周回中の所持金は単調増加なので、開始額(current_stage_start_gold)を下回ったときだけ実消費とみなす。
+        小さなOCRノイズ下振れ(低倍率の[tpl]で発生・実測 約0.1%)は開始額より上にあるため除外せず、正当な
+        クリアが集計除外されるのを防ぐ。マージンは max(3000, 開始額の1%)。
+        """
+        if money is None:
+            return False
+        sg = self.current_stage_start_gold
+        if sg is None:
+            return False
+        sg = int(sg)
+        return int(money) < sg - max(3000, int(sg * 0.01))
+
     def _apply_money_result(self, result: WorkerResult) -> Tuple[int, str]:
         accepted = 0
         note = ""
@@ -3507,7 +3620,7 @@ class MainWindow(QMainWindow):
         # 増加G(session_positive_gain)や直近5分のsamplesには加えない(統計を歪めない)。
         if getattr(result, "money_source", "main") == "rune":
             self._pending_money = None
-            if self.last_money is not None and result.money < self.last_money and self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
+            if self._gold_decrease_is_real(result.money):
                 self.gold_decreased_during_stage = True
             self.last_money = result.money
             self.update_stats(result.money)
@@ -3530,23 +3643,40 @@ class MainWindow(QMainWindow):
                     return 0, "money_spike_held"
         self._pending_money = None
         if self.last_money is not None and result.money < max(0, self.last_money * 0.5):
-            # Large drops can be OCR misses or real spending. Keep the live UI/sample moving,
-            # but exclude the active stage from scoring so the monitor never appears frozen.
             note = "large_gold_drop_candidate"
-            if self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
-                self.gold_decreased_during_stage = True
-
-        if self.last_money is not None and result.money < self.last_money:
-            # Real spending or a small OCR wobble. Accept current gold for display, but mark the
-            # current stage as unsafe so it is not scored with a negative/understated delta.
+        elif self.last_money is not None and result.money < self.last_money:
             note = "gold_decrease_detected"
-            if self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
-                self.gold_decreased_during_stage = True
+        # 集計除外(gold_decreased)は「ステージ開始額を実際に下回った＝買い物等の実消費」のときだけにする。
+        # 周回中の所持金は単調増加なので、開始額を下回るのが実消費。直近値(last_money)比の素朴な減少判定だと、
+        # 低倍率(1x)の[tpl] c≈0.56 で起きる小さなOCRノイズ下振れ(実測 -800〜-1300/約0.1%)でも除外が立ち、
+        # 正当なクリアが集計除外されて「今ステージ周回が更新されない」事故になっていた。
+        if self._gold_decrease_is_real(result.money) and self.stage_state in ("RUNNING", "FINISHING", "FINISH_PENDING"):
+            self.gold_decreased_during_stage = True
 
         accepted = 1
-        prev_money_for_gain = self.last_money
-        if prev_money_for_gain is not None:
-            self.session_positive_gain += max(0, int(result.money) - int(prev_money_for_gain))
+        # 増加Gは“確定ベースライン(gain_baseline)”基準で積む。一過性の誤読で所持金が一時的に小さく読まれ、
+        # 次に正しい値へ回復したとき、その回復差分(≈所持金全額)を利得に二重計上してしまうのが「増加G≈所持金」
+        # バグの正体。下振れではベースラインを下げるだけ(利得は増やさない)、上振れでも1tickで妥当域を超える
+        # 急増は“回復”とみなして利得に加えない（ベースラインだけ追従）ことで往復の純利得を0にする。
+        cur_money = int(result.money)
+        # 増加Gは“信頼できる読み”だけで積む。テンプレ一致[tpl]/tesseract全閾値一致(consensus)以外の
+        # 低信頼読み(ROIズレ時の破片値など)は gain_baseline も動かさない。低信頼ノイズは上下するが、
+        # 正方向だけ累積する旧実装では net で正にドリフトして「増加G≈所持金の数倍」に膨らむ。基準を信頼読みに
+        # 限定することで、ノイズの上振れ(=利得加算)も下振れ後の回復(=二重計上)も断つ。
+        money_trusted = str(result.money_raw or "").startswith("[tpl") or bool(getattr(result, "money_consensus", False))
+        base = getattr(self, "gain_baseline", None)
+        if money_trusted:
+            if base is None:
+                self.gain_baseline = cur_money
+            else:
+                delta = cur_money - int(base)
+                if delta > 0:
+                    implausible_gain = delta >= max(GAIN_SPIKE_ABS, int(base * GAIN_SPIKE_FRAC))
+                    if not implausible_gain:
+                        self.session_positive_gain += delta
+                    self.gain_baseline = cur_money
+                elif delta < 0:
+                    self.gain_baseline = cur_money  # 下振れ(実消費)はベースライン追従のみ＝利得据置
         self.last_money = result.money
         self.samples.append((result.ts, result.money))
         cutoff = result.ts - 900
@@ -3593,6 +3723,13 @@ class MainWindow(QMainWindow):
 
     # Completes the gauge-driven stage boundary and may request a finish OCR sample.
     def finish_stage_run(self, ts: float):
+        if diag.enabled():
+            diag.log(
+                "finish_call", ts=round(ts, 3), stage_state=self.stage_state,
+                ocr_busy=getattr(self, "ocr_busy", False),
+                stage_elapsed=round(ts - self.current_stage_start_ts, 2) if self.current_stage_start_ts else None,
+                max_fill=getattr(self, "stage_max_fill", 0.0), blue_seen=getattr(self, "stage_blue_seen", False),
+            )
         if ts - float(self.last_finish_transition_ts or 0.0) < 1.0:
             return
         # OCRが別処理中ならFINISHINGで固めず、空いた瞬間に再実行する。
@@ -3640,6 +3777,18 @@ class MainWindow(QMainWindow):
         prev = self.gauge_state
         self.gauge_state = result.state
         self.apply_next_gauge_interval(result)
+        if diag.enabled():
+            now = result.ts
+            diag.log(
+                "gauge", state=result.state, prev=prev,
+                fill=result.fill_ratio, blue=result.blue_ratio, purple=result.purple_ratio,
+                roi=list(result.roi) if result.roi else None,
+                stage_state=self.stage_state, active=getattr(self, "_stage_active", False),
+                blue_seen=getattr(self, "stage_blue_seen", False),
+                max_fill=getattr(self, "stage_max_fill", 0.0),
+                start_ts=round(self.current_stage_start_ts, 3) if self.current_stage_start_ts else None,
+                stage_elapsed=round(now - self.current_stage_start_ts, 2) if self.current_stage_start_ts else None,
+            )
         # State machine:
         # purple -> stage running/start; blue_reached -> end reached; blue_reached then purple -> stage finished.
         if self.stage_state in ("WAIT_START", "IDLE"):
@@ -3647,13 +3796,42 @@ class MainWindow(QMainWindow):
                 self.begin_stage_run(result.ts, "purple")
             return
         if self.stage_state == "RUNNING":
-            if result.state == "blue_reached":
-                self.stage_blue_seen = True
-                self.status.showMessage("到達")
-            elif self.stage_blue_seen and result.state != "blue_reached":
-                # 到達後に紫/空/不明へ戻ったら1ステージ終了。
-                # 画像1のようにバーがほぼ空でpurple幅が小さい場合も拾う。
+            fill = float(result.fill_ratio)
+            blue_r = float(result.blue_ratio)
+            self.stage_max_fill = max(getattr(self, "stage_max_fill", 0.0), fill)
+            # --- 完了到達(クリア): 青が十分な幅まで来たら到達。引いたら1ステージ終了として記録する。---
+            if blue_r >= GAUGE_REACH_BLUE:
+                if not self.stage_blue_seen:
+                    self.stage_blue_seen = True
+                    self.status.showMessage("到達")
+                return
+            if self.stage_blue_seen:
+                # 到達後に青が引いた(紫/空/不明)ら1ステージ終了（クリア確定→記録）。
                 self.finish_stage_run(result.ts)
+                return
+            present = result.state in ("purple", "blue", "blue_reached")  # 本物のゲージが見えている
+            if self._stage_active:
+                # 計測中。満タン→空なら青取り逃しクリアとして記録。state=unknown かつ 空 なら失敗/遷移/再開＝計測停止。
+                if self.stage_max_fill >= GAUGE_MISSED_CLEAR_FILL and fill <= GAUGE_EMPTY_FILL:
+                    self.status.showMessage("到達(満タン→消失を検知)")
+                    self.finish_stage_run(result.ts)
+                    return
+                if not present and fill <= GAUGE_EMPTY_FILL:
+                    # 本物ゲージが消え かつ 空 = ステージ終了。記録せずアイドル(ステージ秒=「-」)へ。
+                    # レイアウトメニューが覆って unknown でも fill>EMPTY のノイズなら継続中扱い＝誤リセットしない。
+                    self.status.showMessage("ステージ秒リセット(ゲージ空)")
+                    self._idle_stage()
+                return
+            # --- 非アクティブ(挑戦間/メニュー/ナビ)。state=purple/blue が連続したら「本物の充填」として計測開始。---
+            # メニュー/ナビ中はノイズで fill が動いても state は unknown のままなので開始しない（②の誤カウントを根絶）。
+            if fill <= GAUGE_EMPTY_FILL:
+                self._fill_rise_ts = None              # 空に戻った＝立ち上がり前。仮起点を破棄
+            elif self._fill_rise_ts is None:
+                self._fill_rise_ts = result.ts          # ゲージが上がり始めた時刻を仮記録（計測開始時の起点に使う）
+            self._active_streak = self._active_streak + 1 if present else 0
+            if self._active_streak >= GAUGE_ACTIVE_ARM:
+                # 本物のステージ充填を確認 → 計測開始（起点は立ち上がり時刻に合わせ、待機分も計測に含める）。
+                self.begin_stage_run(self._fill_rise_ts or result.ts, "gauge")
             return
         if self.stage_state in ("FINISHING", "FINISH_PENDING"):
             # Wait for finish OCR to commit. The current purple state will become next RUNNING after commit.
@@ -3695,6 +3873,14 @@ class MainWindow(QMainWindow):
         """
         if not self.session_id:
             return
+        # テロップが「失敗」の周回はクリアとして記録しない（効率統計を汚さない）。次周回の基準だけ更新して継続。
+        if result.stage_kind == "fail":
+            diag.log("commit_skip", reason="fail_telop", stage=result.stage, money=result.money)
+            self.status.showMessage("ステージ失敗を検出: この周回は記録せず継続")
+            if result.money is not None:
+                self.last_stage_money = result.money
+            self._set_stage_running(result.money if result.money is not None else self.last_money, result.ts)
+            return
         end_money = result.money if result.money is not None else self.last_money
         if end_money is None:
             self.status.showMessage("終了OCRで所持金が読めませんでした")
@@ -3710,6 +3896,12 @@ class MainWindow(QMainWindow):
         dur = choose_commit_duration(ocr_durs, measured_elapsed)
         stage = self.correct_stage_for_context(result.stage, result.stage_raw, result.stage_candidates)
         delta = int(end_money - start_gold)
+        diag.log(
+            "commit_eval", stage=stage, raw_stage=result.stage, dur=dur, ocr_durs=ocr_durs,
+            measured=measured_elapsed, start_gold=start_gold, end_money=end_money, delta=delta,
+            gold_decreased=bool(getattr(self, "gold_decreased_during_stage", False)),
+            kind=result.stage_kind, start_ts_set=self.current_stage_start_ts is not None,
+        )
         if delta < 0 or getattr(self, "gold_decreased_during_stage", False):
             # Spending gold during/around the run makes the clear efficiency unknowable from holdings.
             # Do not create negative GPS/GPH. Reset the baseline to the current gold and continue.
@@ -3793,6 +3985,7 @@ class MainWindow(QMainWindow):
                 self.current_stage_state_lbl.setText("周回中")
         # Do not immediately treat the same purple/reset frame as a new clear.
         # The next run starts from this end gold, but a new log requires a fresh blue_reached transition.
+        diag.log("commit_record", stage=stage, dur=dur, delta=delta, merged=merged, valid=valid)
         self._set_stage_running(end_money, result.ts)
         self._refresh_stage_views()
         action = "ステージ記録を統合" if merged else "ステージ記録"
@@ -3957,6 +4150,13 @@ class MainWindow(QMainWindow):
         self.ocr_busy = False
         if not self.running:
             return
+        if diag.enabled() and not result.error:
+            diag.log(
+                "tick", purpose=result.purpose, stage_state=self.stage_state,
+                money=result.money, kind=result.stage_kind, stage=result.stage,
+                start_ts=round(self.current_stage_start_ts, 3) if self.current_stage_start_ts else None,
+                stage_elapsed=round(result.ts - self.current_stage_start_ts, 2) if self.current_stage_start_ts else None,
+            )
         if result.error:
             self.status.showMessage(f"OCRエラー: {result.error}")
         else:
@@ -3977,8 +4177,15 @@ class MainWindow(QMainWindow):
                 if self._money_miss_streak >= 3:
                     self._money_miss_streak = 0
                     self._reacquire_rois()
+            # ワーカーが「凍結コインのズレ」を検知して当フレームだけ再検出していたら、本スレ側でも
+            # 一度だけ probe を投げてキャッシュ(凍結ROI)を新位置へ更新する（毎tick再検出の常態化を防ぐ）。
+            if getattr(result, "roi_recovered", False):
+                self._reacquire_rois()
             self._persist_worker_sample(result, accepted, note)
             self._handle_worker_purpose(result)
+            # ステージ境界(クリア/失敗/遷移/再開)は on_gauge_finished のゲージ軌跡に一本化済み。
+            # ここでテロップからリセット/記録を起こす旧2経路は撤去（実機で遅延/レース発火していたため）。
+            # テロップ種別(result.stage_kind)はクリア/失敗の記録分類用に commit 側でのみ参照する。
             # jp21: 通常OCR tickではステージ履歴を作らない。
             # ステージ履歴は右下ゲージの「青到達→紫戻り」1回につき1行だけ作る。
             # 生ログは常時更新しすぎない。最後のOCR結果だけ表示。
@@ -4174,6 +4381,12 @@ class MainWindow(QMainWindow):
             pass
         return vals, total_count
 
+    @staticmethod
+    def _is_boss_stage(stage: str) -> bool:
+        """n-10 はボスマップ。自発素材が必要でクリアが速く、効率比較に入れると常に最高効率になってしまうため
+        ★オススメ/♛/◎ の推薦対象からは除外する（効率表のセル自体には参考として残す）。"""
+        return bool(re.match(r"^\d+-10$", str(stage)))
+
     def _stage_efficiency_rows(self) -> Dict[str, Tuple[float, float, int, int, int, int]]:
         """Return stage -> (best_gps, best_gph, adopted_count, total_count, best_duration, best_delta).
 
@@ -4233,12 +4446,14 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "eff_cells"):
             return
         data = self._stage_efficiency_rows()
+        # ♛(指標トップ)/◎(GPH推奨)は n-10 ボスを除外して選ぶ（セル表示は全ステージ維持）。
+        rec_pool = {s: v for s, v in data.items() if not self._is_boss_stage(s)}
         top_stage = None
-        if data:
-            top_stage = max(data.items(), key=lambda kv: self._eff_metric_value(kv[1]))[0]
+        if rec_pool:
+            top_stage = max(rec_pool.items(), key=lambda kv: self._eff_metric_value(kv[1]))[0]
         recommended = None
-        if data:
-            recommended = max(data.items(), key=lambda kv: kv[1][1])[0]
+        if rec_pool:
+            recommended = max(rec_pool.items(), key=lambda kv: kv[1][1])[0]
         for stage, cell in self.eff_cells.items():
             cell.set_stage_data(data.get(stage), getattr(self, "eff_metric", "gps"), stage == top_stage, stage == recommended)
             cell.set_selected_visual(stage == getattr(self, "selected_eff_stage", None))
@@ -4250,10 +4465,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "recommend_lbl"):
             return
         data = self._stage_efficiency_rows()
-        if not data:
+        # n-10 ボスは自発素材必須＆クリアが速く常に最高効率になるためオススメ対象から除外。
+        rec_pool = {s: v for s, v in data.items() if not self._is_boss_stage(s)}
+        if not rec_pool:
             self.recommend_lbl.setText("★オススメ -")
             return
-        stage, (gps, gph, adopted, total, dur, delta) = max(data.items(), key=lambda kv: kv[1][1])
+        stage, (gps, gph, adopted, total, dur, delta) = max(rec_pool.items(), key=lambda kv: kv[1][1])
         runh = (3600.0 / dur) if dur else 0.0
         self.recommend_lbl.setText(f"★オススメ {stage} / GPS {gps:,.2f} / GPH {gph:,.0f} / {runh:,.1f}周")
 
@@ -4473,6 +4690,7 @@ class MainWindow(QMainWindow):
         self.current_stage_start_ts = time.time() if self.running else None
         self.stage_state = "WAIT_START"
         self.stage_blue_seen = False
+        self.stage_max_fill = 0.0
         self.stage_loop_lbl.setText("-")
         self.refresh_stage_summary_table()
         self.refresh_session_log_table()
@@ -4488,6 +4706,7 @@ class MainWindow(QMainWindow):
         self.session_start_ts = time.time()
         self.samples = [(self.session_start_ts, self.last_money)]
         self.session_positive_gain = 0
+        self.gain_baseline = self.last_money
         self.update_stats(self.last_money)
         self.status.showMessage("基準を現在所持金にリセット")
 

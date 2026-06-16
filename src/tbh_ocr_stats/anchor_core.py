@@ -12,7 +12,7 @@ from .runtime_env import DEFAULT_ANCHOR_TEMPLATE, DEFAULT_BOSS_TEMPLATE, user_an
 
 
 ANCHOR_TEMPLATE_GAME_SCALE = 1.5
-SUPPORTED_GAME_SCALES = [1.0, 1.25, 1.5, 2.0, 3.0]
+SUPPORTED_GAME_SCALES = [1.0, 1.25, 1.5]  # x2/x3 はゲームアップデートで廃止
 
 AUTO_ROI_LAYOUT = {
     "money": [36, -1, 112, 31],
